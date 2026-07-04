@@ -854,7 +854,7 @@ func cmdSend(args []string) error {
 	ch := fs.String("channel", "", "channel NAME to send on")
 	text := fs.String("text", "", "message text")
 	to := fs.String("to", "", "thread/chat/group id to deliver to (default: the channel's configured target)")
-	replyTo := fs.String("reply-to", "", "message id this send replies to (threads the reply)")
+	replyTo := fs.String("reply-to", "", "message id this send replies to, or \"last\" for the newest inbound on the channel/thread")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -864,6 +864,25 @@ func cmdSend(args []string) error {
 	cfg, err := loadConfig(*cfgPath)
 	if err != nil {
 		return err
+	}
+	// Conversation-first: --reply-to last answers the obvious previous message and
+	// inherits its thread, no id bookkeeping.
+	if *replyTo == "last" {
+		box, berr := inbox.Open(home.InboxPath())
+		if berr != nil {
+			return berr
+		}
+		last, ok, lerr := box.Last(*ch, *to)
+		if lerr != nil {
+			return lerr
+		}
+		if !ok {
+			return fmt.Errorf("no previous message on channel %q to reply to", *ch)
+		}
+		*replyTo = last.ID
+		if *to == "" {
+			*to = last.ThreadID
+		}
 	}
 	env := envelope.Normalize(envelope.Envelope{
 		Channel:  *ch,

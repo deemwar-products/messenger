@@ -48,6 +48,27 @@ func (i *Inbox) Append(env envelope.Envelope) error {
 	return nil
 }
 
+// Last returns the most recent inbound envelope on channel (and, when thread is
+// non-empty, in that thread) — the message a conversational reply is "obviously" for.
+// ok=false when the conversation has no messages yet.
+func (i *Inbox) Last(channel, thread string) (envelope.Envelope, bool, error) {
+	msgs, _, err := i.Since(0)
+	if err != nil {
+		return envelope.Envelope{}, false, err
+	}
+	for j := len(msgs) - 1; j >= 0; j-- {
+		m := msgs[j]
+		if m.Channel != channel {
+			continue
+		}
+		if thread != "" && m.ThreadID != thread {
+			continue
+		}
+		return m, true, nil
+	}
+	return envelope.Envelope{}, false, nil
+}
+
 // Since returns every envelope after 1-based offset `since` (since<=0 means from the
 // start), plus the new offset the caller should pass next time. A missing file is empty.
 func (i *Inbox) Since(since int) ([]envelope.Envelope, int, error) {

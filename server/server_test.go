@@ -75,6 +75,19 @@ func TestServe_SendThreadsAndInboxReadsSince(t *testing.T) {
 		t.Fatalf("bad delivered envelope: %v", delivered)
 	}
 
+	// POST /send with reply_to "last" → threads onto the NEWEST inbound message on the
+	// channel and inherits its thread, no id bookkeeping.
+	lr, _ := http.NewRequest(http.MethodPost, srv.URL+"/send",
+		strings.NewReader(`{"channel":"out","text":"auto reply","reply_to":"last"}`))
+	lr.Header.Set("Authorization", "Bearer tok")
+	lresp, err := http.DefaultClient.Do(lr)
+	if err != nil || lresp.StatusCode != http.StatusOK {
+		t.Fatalf("reply-last failed: err=%v code=%v", err, lresp.StatusCode)
+	}
+	if delivered["reply_to"] != "m-2" || delivered["thread_id"] != "t-2" {
+		t.Fatalf("reply last should target m-2 in t-2: %v", delivered)
+	}
+
 	// GET /inbox?since=1 → only the second message.
 	ir, _ := http.NewRequest(http.MethodGet, srv.URL+"/inbox?since=1", nil)
 	ir.Header.Set("Authorization", "Bearer tok")
@@ -90,5 +103,5 @@ func TestServe_SendThreadsAndInboxReadsSince(t *testing.T) {
 }
 
 func mkEnv(id, text string) envelope.Envelope {
-	return envelope.Normalize(envelope.Envelope{ID: id, Channel: "out", Text: text})
+	return envelope.Normalize(envelope.Envelope{ID: id, Channel: "out", Text: text, ThreadID: "t-" + id[len(id)-1:]})
 }

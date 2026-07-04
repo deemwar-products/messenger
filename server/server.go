@@ -68,11 +68,30 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "channel and text are required", http.StatusBadRequest)
 		return
 	}
+	// Conversation-first: reply_to "last" resolves to the newest inbound message on
+	// this channel (and thread, when given) and inherits its thread — "answer the
+	// obvious previous message" without the caller bookkeeping ids.
+	replyTo, to := req.ReplyTo, req.To
+	if replyTo == "last" {
+		last, ok, lerr := s.box.Last(req.Channel, req.To)
+		if lerr != nil {
+			http.Error(w, lerr.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			http.Error(w, "no previous message on channel "+req.Channel+" to reply to", http.StatusConflict)
+			return
+		}
+		replyTo = last.ID
+		if to == "" {
+			to = last.ThreadID
+		}
+	}
 	env := envelope.Normalize(envelope.Envelope{
 		Channel:  req.Channel,
 		Text:     req.Text,
-		ThreadID: req.To,
-		ReplyTo:  req.ReplyTo,
+		ThreadID: to,
+		ReplyTo:  replyTo,
 		Origin:   "messenger",
 	})
 	id, err := s.rt.Send(r.Context(), env)

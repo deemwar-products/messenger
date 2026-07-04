@@ -68,6 +68,15 @@ cursor only on 2xx; on failure back off (1s → 60s) and retry — a consumer th
 was down catches up from its cursor. Wakes on new-append notify + 5s tick.
 `--webhook URL` on `listen` remains as an ad-hoc unnamed push (no cursor).
 
+## Conversation is first-class
+
+Every inbound envelope carries `id` + `thread_id`; a reply is `{channel, text,
+reply_to: <id>}`. The shortcut `reply_to: "last"` resolves to the newest inbound
+message on the channel (scoped to `to`'s thread when given) and inherits its thread —
+the "answer the obvious previous message" case needs no id bookkeeping. Subscriptions
+default to ALL channels (the `channels` filter is opt-in), so a consumer holds whole
+conversations across every port.
+
 ## Send returns the provider message id
 
 `POST /send` and `messenger send` return the id the platform assigned

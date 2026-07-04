@@ -59,7 +59,9 @@ Every inbound Envelope carries a stable `id` (telegram `message_id`, wacli id, o
 minted) and a `thread_id` (telegram chat id / whatsapp group JID). To reply *to that
 message*, pass its `id` as `--reply-to`: telegram → `reply_to_message_id`, whatsapp →
 wacli `--quote`, webhook → echoed. `/send` returns YOUR message's id, so you can thread
-onto your own sends.
+onto your own sends. **Shortcut:** `--reply-to last` (or `"reply_to":"last"` on
+`POST /send`) answers the newest inbound message on the channel — scoped to `--to`'s
+thread when given, inheriting its thread otherwise — no id bookkeeping.
 
 ## Rules
 

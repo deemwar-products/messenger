@@ -71,6 +71,11 @@ its `id` as `reply_to` — telegram uses `reply_to_message_id`, whatsapp uses wa
 `--quote`, webhook echoes it. `/send` returns the id of YOUR outbound message, so
 consumers can thread onto their own sends too.
 
+**Conversation-first shortcut:** `reply_to: "last"` (API) or `--reply-to last` (CLI)
+answers the newest inbound message on the channel (scoped to `to`'s thread when given)
+and inherits its thread — "reply to the obvious previous message" with zero id
+bookkeeping: `messenger send --channel ops --text "on it" --reply-to last`.
+
 ## Secrets
 
 Referenced by **NAME** only (`TELEGRAM_BOT_TOKEN`, `MESSENGER_HOOK_SECRET`,
