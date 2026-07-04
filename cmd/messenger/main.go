@@ -22,7 +22,10 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -43,6 +46,8 @@ func main() {
 	switch os.Args[1] {
 	case "setup":
 		err = cmdSetup(os.Args[2:])
+	case "channel", "channels":
+		err = cmdChannel(os.Args[2:])
 	case "listen":
 		err = cmdListen(os.Args[2:])
 	case "send":
@@ -67,40 +72,265 @@ func usage() {
 	fmt.Fprint(os.Stderr, `messenger — standalone channel I/O (telegram, whatsapp, hook)
 
 usage:
-  messenger setup  [--config PATH] [--force]
-  messenger listen [--config PATH] [--addr :14310] [--webhook URL]
-  messenger send   --channel telegram --text "hi" [--to THREAD] [--reply-to MSGID] [--config PATH]
-  messenger serve  [--config PATH] [--addr :14310]
+  messenger setup                       scaffold home + an empty config
+  messenger channel add <kind> <name>   add a channel (kind: telegram|whatsapp|hook)
+  messenger channel list                list configured channels
+  messenger channel remove <name>       remove a channel
+  messenger channel connect <name>      connect/pair a channel (wacli auth / telegram setWebhook)
+  messenger listen [--addr :14310] [--webhook URL]
+  messenger send   --channel <name> --text "hi" [--to THREAD] [--reply-to MSGID]
+  messenger serve  [--addr :14310]
+
+channel add flags:
+  --token-env NAME    env var holding the token (telegram bot token, hook secret)
+  --chat-id ID        default target chat/channel id (telegram: the channel to post to)
+  --account NAME      platform account/workspace label
+  --token-vault NAME  age vault entry holding the token (instead of --token-env)
+  --option k=v        repeatable free-form option (e.g. --option bin=wacli)
+  --disabled          add the channel disabled
+
+  e.g.  messenger channel add whatsapp home
+        messenger channel add telegram mybot --token-env TELEGRAM_BOT_TOKEN --chat-id -1001234567890
 `)
 }
 
-// starterConfig is the commented config.toml `setup` writes. Secrets are referenced by
-// NAME only — never a value.
-const starterConfig = `# messenger config — secrets are referenced by NAME only, never a value.
-# The HTTP bearer token for POST /send / GET /inbox (leave empty for loopback dev):
-serveTokenEnv = "MESSENGER_SERVE_TOKEN"
+// optionFlags collects repeatable --option k=v pairs.
+type optionFlags map[string]string
 
-[transports.telegram]
-enabled  = true
-kind     = "telegram"
-tokenEnv = "TELEGRAM_BOT_TOKEN"   # bot token (used only by send)
-# options.path        = "/telegram/telegram"   # webhook mount path
-# options.secretHeader = "X-Telegram-Bot-Api-Secret-Token"  # verify inbound webhook
+func (o optionFlags) String() string { return "" }
+func (o optionFlags) Set(v string) error {
+	i := strings.IndexByte(v, '=')
+	if i < 0 {
+		return fmt.Errorf("option must be k=v, got %q", v)
+	}
+	o[v[:i]] = v[i+1:]
+	return nil
+}
 
-[transports.whatsapp]
-enabled = false
-kind    = "whatsapp"
-# options.bin  = "wacli"                       # the paired-device CLI to shell
-# options.args = "--json sync --follow"        # NDJSON message stream
+// cmdChannel is the channel management group: add / list / remove / connect. All edits
+// write config.toml; secrets are referenced by NAME only (--token-env / --token-vault),
+// never a value.
+func cmdChannel(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: messenger channel <add|list|remove|connect> ...")
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "list", "ls":
+		return channelList(rest)
+	case "add":
+		return channelAdd(rest)
+	case "remove", "rm":
+		return channelRemove(rest)
+	case "connect":
+		return channelConnect(rest)
+	default:
+		return fmt.Errorf("unknown channel subcommand %q", sub)
+	}
+}
 
-[transports.hook]
-enabled  = true
-kind     = "hook"
-tokenEnv = "MESSENGER_HOOK_SECRET"   # HMAC shared secret for inbound POST /hook/hook
-`
+func channelList(args []string) error {
+	fs := flag.NewFlagSet("channel list", flag.ContinueOnError)
+	cfgPath := fs.String("config", "", "config path")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := loadConfig(*cfgPath)
+	if err != nil {
+		return err
+	}
+	if len(cfg.Transports) == 0 {
+		fmt.Println("no channels configured. add one: messenger channel add <kind> <name>")
+		return nil
+	}
+	names := make([]string, 0, len(cfg.Transports))
+	for n := range cfg.Transports {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	fmt.Printf("%-16s %-10s %-8s %s\n", "NAME", "KIND", "ENABLED", "TARGET/OPTIONS")
+	for _, n := range names {
+		t := cfg.Transports[n]
+		kind := t.Kind
+		if kind == "" {
+			kind = n
+		}
+		detail := ""
+		if id := t.Options["chatId"]; id != "" {
+			detail = "chat=" + id
+		}
+		fmt.Printf("%-16s %-10s %-8v %s\n", n, kind, t.Enabled, detail)
+	}
+	return nil
+}
 
-// cmdSetup scaffolds the home directory and a starter config.toml (idempotent unless
-// --force). It prints, but never writes, the secret NAMES to set.
+func channelAdd(args []string) error {
+	// Leading positionals first (<kind> <name>), then flags — Go's flag pkg stops at the
+	// first non-flag token, so we split them ourselves.
+	if len(args) < 2 {
+		return fmt.Errorf("usage: messenger channel add <kind> <name> [flags]")
+	}
+	kind, name := args[0], args[1]
+	fs := flag.NewFlagSet("channel add", flag.ContinueOnError)
+	cfgPath := fs.String("config", "", "config path")
+	tokenEnv := fs.String("token-env", "", "env var NAME holding the token")
+	tokenVault := fs.String("token-vault", "", "age vault entry NAME holding the token")
+	account := fs.String("account", "", "platform account/workspace label")
+	chatID := fs.String("chat-id", "", "default target chat/channel id")
+	disabled := fs.Bool("disabled", false, "add the channel disabled")
+	opts := optionFlags{}
+	fs.Var(&opts, "option", "repeatable free-form option k=v")
+	if err := fs.Parse(args[2:]); err != nil {
+		return err
+	}
+	switch kind {
+	case "telegram", "whatsapp", "hook":
+	default:
+		return fmt.Errorf("unknown kind %q (telegram|whatsapp|hook)", kind)
+	}
+
+	path := *cfgPath
+	if path == "" {
+		path = home.ConfigPath()
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+		cfg = &config.Config{Transports: map[string]config.Transport{}}
+	}
+	if cfg.Transports == nil {
+		cfg.Transports = map[string]config.Transport{}
+	}
+	if _, exists := cfg.Transports[name]; exists {
+		return fmt.Errorf("channel %q already exists (remove it first)", name)
+	}
+	if *chatID != "" {
+		opts["chatId"] = *chatID
+	}
+	if len(opts) == 0 {
+		opts = nil
+	}
+	cfg.Transports[name] = config.Transport{
+		Enabled:    !*disabled,
+		Kind:       kind,
+		Account:    *account,
+		TokenEnv:   *tokenEnv,
+		TokenVault: *tokenVault,
+		Options:    opts,
+	}
+	if err := os.MkdirAll(home.Dir(), 0o700); err != nil {
+		return err
+	}
+	if err := config.Save(path, cfg); err != nil {
+		return err
+	}
+	fmt.Printf("added channel %q (kind=%s, enabled=%v) to %s\n", name, kind, !*disabled, path)
+	if *tokenEnv != "" {
+		fmt.Printf("  remember to export %s (value never printed)\n", *tokenEnv)
+	}
+	if kind == "whatsapp" {
+		fmt.Printf("  pair once: messenger channel connect %s\n", name)
+	}
+	return nil
+}
+
+func channelRemove(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: messenger channel remove <name>")
+	}
+	name := args[0]
+	fs := flag.NewFlagSet("channel remove", flag.ContinueOnError)
+	cfgPath := fs.String("config", "", "config path")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	path := *cfgPath
+	if path == "" {
+		path = home.ConfigPath()
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+	if _, ok := cfg.Transports[name]; !ok {
+		return fmt.Errorf("no channel named %q", name)
+	}
+	delete(cfg.Transports, name)
+	if err := config.Save(path, cfg); err != nil {
+		return err
+	}
+	fmt.Printf("removed channel %q\n", name)
+	return nil
+}
+
+// channelConnect performs the connect/pair action for a channel: whatsapp runs the
+// paired-device auth (wacli auth); telegram prints the setWebhook to run against a public
+// URL; hook needs no connect. It never handles a secret value directly.
+func channelConnect(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: messenger channel connect <name>")
+	}
+	name := args[0]
+	fs := flag.NewFlagSet("channel connect", flag.ContinueOnError)
+	cfgPath := fs.String("config", "", "config path")
+	publicURL := fs.String("public-url", "", "public base URL (telegram setWebhook)")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	cfg, err := loadConfig(*cfgPath)
+	if err != nil {
+		return err
+	}
+	t, ok := cfg.Transports[name]
+	if !ok {
+		return fmt.Errorf("no channel named %q", name)
+	}
+	kind := t.Kind
+	if kind == "" {
+		kind = name
+	}
+	switch kind {
+	case "whatsapp":
+		bin := t.Options["bin"]
+		if bin == "" {
+			bin = "wacli"
+		}
+		fmt.Printf("pairing whatsapp %q via %s auth — scan the QR:\n", name, bin)
+		cmd := exec.Command(bin, "auth")
+		cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
+		return cmd.Run()
+	case "telegram":
+		path := t.Options["path"]
+		if path == "" {
+			path = "/telegram/" + name
+		}
+		if *publicURL == "" {
+			fmt.Printf("telegram %q webhook path is %s\n", name, path)
+			fmt.Printf("re-run with --public-url https://<host> to print the setWebhook call\n")
+			return nil
+		}
+		fmt.Printf("set the webhook (run against your bot token, kept out of this output):\n")
+		fmt.Printf("  curl -sS \"https://api.telegram.org/bot$%s/setWebhook\" -d \"url=%s%s\"\n",
+			envNameOr(t.TokenEnv, "TELEGRAM_BOT_TOKEN"), strings.TrimRight(*publicURL, "/"), path)
+		return nil
+	default:
+		fmt.Printf("channel %q (kind=%s) needs no connect step\n", name, kind)
+		return nil
+	}
+}
+
+func envNameOr(name, fallback string) string {
+	if name != "" {
+		return name
+	}
+	return fallback
+}
+
+// cmdSetup scaffolds the home directory and an empty config.toml (idempotent unless
+// --force), then points at `channel add`. Channels are added individually so many of any
+// kind can coexist.
 func cmdSetup(args []string) error {
 	fs := flag.NewFlagSet("setup", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "config path (default $MESSENGER_HOME/config.toml)")
@@ -116,22 +346,24 @@ func cmdSetup(args []string) error {
 		return err
 	}
 	if _, err := os.Stat(path); err == nil && !*force {
-		fmt.Printf("config already exists at %s (use --force to overwrite)\n", path)
+		fmt.Printf("config already exists at %s (use --force to reset)\n", path)
 	} else {
-		if err := os.WriteFile(path, []byte(starterConfig), 0o600); err != nil {
+		empty := &config.Config{ServeTokenEnv: "MESSENGER_SERVE_TOKEN", Transports: map[string]config.Transport{}}
+		if err := config.Save(path, empty); err != nil {
 			return err
 		}
-		fmt.Printf("wrote starter config to %s\n", path)
+		fmt.Printf("scaffolded home + empty config at %s\n", path)
 	}
 	fmt.Print(`
-next steps:
-  1. export the secret NAMES referenced in the config (values, never printed):
-       export TELEGRAM_BOT_TOKEN=...        # your bot token
-       export MESSENGER_HOOK_SECRET=...     # any strong shared secret
-       export MESSENGER_SERVE_TOKEN=...     # bearer for the HTTP API (optional)
-  2. messenger serve            # channel webhooks + POST /send, GET /inbox, /health
-  3. point Telegram's setWebhook at  https://<public-host>/telegram/telegram
-  4. (whatsapp) pair once with `+"`wacli auth`"+`, then enable [transports.whatsapp]
+add channels (many of any kind can coexist):
+  messenger channel add whatsapp home
+  messenger channel add telegram mybot --token-env TELEGRAM_BOT_TOKEN --chat-id -1001234567890
+  messenger channel add hook incoming --token-env MESSENGER_HOOK_SECRET
+then:
+  messenger channel list
+  messenger channel connect <name>     # whatsapp QR pair / telegram setWebhook
+  messenger serve                      # channel webhooks + POST /send, GET /inbox, /health
+secrets are referenced by NAME only — export the values, never printed here.
 `)
 	return nil
 }

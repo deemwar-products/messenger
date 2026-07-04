@@ -131,6 +131,11 @@ func Deliver(ctx context.Context, cfg *config.Config, senders *transport.SenderR
 	if !ok {
 		return &deliverErr{"no sender for kind: " + kind}
 	}
+	// Fall back to the channel's configured default target (e.g. a telegram chat/channel
+	// id) when the caller named no thread.
+	if env.ThreadID == "" {
+		env.ThreadID = tcfg.Options["chatId"]
+	}
 	return snd.Send(ctx, env, tcfg, resolver)
 }
 

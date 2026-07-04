@@ -23,8 +23,17 @@ outbound: send(channel, text, --to thread, --reply-to id) → matching adapter �
 
 ## The verbs (always via `task`, env from .env — never the shell)
 
-- **`task setup`** — scaffold `~/.config/messenger/config.toml` + home dirs, then print the
-  secret NAMES to export. Secrets are referenced by NAME only; a value never enters config.
+- **`task setup`** — scaffold `~/.config/messenger/config.toml` + home dirs (empty), then
+  point at `channel add`. Secrets are referenced by NAME only; a value never enters config.
+- **channels — many of any kind, keyed by name:**
+  - `messenger channel add whatsapp home`
+  - `messenger channel add telegram mybot --token-env TELEGRAM_BOT_TOKEN --chat-id -1001234567890`
+  - `messenger channel add hook incoming --token-env MESSENGER_HOOK_SECRET`
+  - `messenger channel list` — NAME / KIND / ENABLED / default target
+  - `messenger channel remove <name>`
+  - `messenger channel connect <name>` — whatsapp QR pair (`wacli auth`); telegram prints the
+    `setWebhook` (add `--public-url https://host`). A configured `--chat-id` becomes the
+    default send target, so `send --channel mybot --text hi` needs no `--to`.
 - **`task serve`** — the small HTTP server: channel webhooks + the consumer API on one port.
   - `GET  /health`
   - `POST /send`  `{channel, text, to?, reply_to?}` (bearer-auth when `serveTokenEnv` set)

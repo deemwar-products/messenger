@@ -15,8 +15,16 @@ outbound: send(channel, text, --to thread, --reply-to id) → matching adapter �
 ## Quick start
 
 ```sh
-task setup                 # scaffold ~/.config/messenger/config.toml + print secret NAMES
+task setup                 # scaffold ~/.config/messenger/config.toml (empty) + home
 cp .env.example .env       # fill in the secret VALUES (gitignored, never committed)
+
+# add channels — many of any kind, each keyed by its own name:
+messenger channel add whatsapp home
+messenger channel add telegram mybot --token-env TELEGRAM_BOT_TOKEN --chat-id -1001234567890
+messenger channel add hook incoming --token-env MESSENGER_HOOK_SECRET
+messenger channel list
+messenger channel connect mybot --public-url https://<host>   # setWebhook / wacli pair
+
 task serve                 # channel webhooks + POST /send, GET /inbox, GET /health
 ```
 
@@ -27,7 +35,8 @@ ambient shell. `task -l` lists all verbs.
 
 | verb | what |
 |------|------|
-| `task setup` | scaffold config + home; print the secret NAMES to export |
+| `task setup` | scaffold an empty config + home |
+| `messenger channel add/list/remove/connect` | manage channels (many of any kind, keyed by name) |
 | `task serve` | HTTP server: `/health`, `POST /send`, `GET /inbox?since=N`, + channel webhooks |
 | `task listen` | ingress only: append inbound to the inbox; optional `--webhook URL` push |
 | `task send -- --channel telegram --text "hi" --to 123 --reply-to 42` | one-shot egress, threaded |
