@@ -29,7 +29,7 @@ webhook = every hook its own channel.
 | `inbox/` | append-only NDJSON inbound store + read-since (the delivery queue) |
 | `server/` | the `serve` HTTP surface |
 | `skills/` | the portable agent skill (embedded via go:embed; installed by the binary) |
-| `docs/SPEC.md` | the v2 spec (conversation-hub model) |
+| `docs/` | SPEC.md (product model) · ARCHITECTURE.md (code-level) · API.md (HTTP surface) |
 
 ## Rules
 

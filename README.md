@@ -4,7 +4,12 @@ Broker-free **conversation hub** as one static Go binary. It owns receiving and 
 messages over **telegram**, **whatsapp**, and generic **webhook** channels, and delivers
 inbound messages to N consumers with durable per-consumer cursors — so any product (a
 trading desk, an agent OS, a script) plugs in over plain HTTP. No broker. The CLI is the
-whole interface. Full design: `docs/SPEC.md`.
+whole interface.
+
+**Docs:** [`docs/SPEC.md`](docs/SPEC.md) (product model) ·
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (packages, flows, design decisions) ·
+[`docs/API.md`](docs/API.md) (HTTP surface, exact shapes) ·
+[`skills/messenger/`](skills/messenger/) (agent skill + per-kind references)
 
 ```
 ports (channels)           hub                       consumers (subscriptions)
