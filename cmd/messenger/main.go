@@ -188,8 +188,10 @@ next — add channels (many of any kind, keyed by name):
 then:
   messenger channel list
   messenger channel connect <name>     # whatsapp QR pair (once per host) / telegram setWebhook
+  messenger channel test               # probe every channel without sending
   messenger subscribe add factory --url http://localhost:9000/hook
   messenger serve                      # webhooks + /send + /inbox + subscription push
+  messenger install --skills           # let AI agents drive messenger (~/.claude/skills)
 secrets are referenced by NAME only — export the values, never printed here.
 `)
 	return nil
