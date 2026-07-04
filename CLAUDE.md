@@ -40,8 +40,11 @@ webhook = every hook its own channel.
 - **Secrets are use-only.** Reference by env-var NAME (`TELEGRAM_BOT_TOKEN`,
   `MESSENGER_HOOK_SECRET`, `MESSENGER_SERVE_TOKEN`); resolve host-only at the point of use.
   Never print, log, commit, or bake a value; use `YOUR_KEY_HERE` in examples.
-- **One interface per channel kind.** New kinds implement `channel.Channel` (+ `Pushed`
-  or a kind-level `Streamer`) and register a `KindSpec` — never a parallel registry.
+- **One interface per channel kind.** New kinds (teams, slack, …) implement
+  `channel.Channel` (+ `Pushed` or a kind-level `Streamer`) and call
+  `channel.Register(KindSpec{...})` — one file, never a parallel registry.
+- **One hub per host.** `serve`/`listen` probe the addr and reuse a running instance
+  (`/health` → `"service":"messenger"`); never engineer around this to double-start.
 - **Conventional commits** (`feat:`, `fix:`, `docs:`, `test:`, `chore:`). Do NOT add
   `Co-authored-by:`.
 - Touch only what the task needs; note unrelated issues rather than fixing them inline.

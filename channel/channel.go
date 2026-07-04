@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"sync"
 
 	"github.com/deemwar-products/messenger/config"
 	"github.com/deemwar-products/messenger/envelope"
@@ -70,25 +71,62 @@ type KindSpec struct {
 	// OpenStream builds the kind's single shared inbound stream over every enabled
 	// channel of this kind. Nil for pushed-only kinds.
 	OpenStream func(chans map[string]config.Transport, res *SecretResolver) (Streamer, error)
+	// Test probes connectivity for one channel WITHOUT sending a message: whatsapp
+	// checks the global device, telegram calls getMe with the token (by NAME),
+	// webhook verifies the secret is resolvable. It returns human-readable lines;
+	// a secret value never appears in them. Nil = nothing to test.
+	Test func(ctx context.Context, name string, cfg config.Transport, res *SecretResolver) ([]string, error)
 }
 
-// Kinds is the registry of built-in kinds, keyed by canonical name.
-func Kinds() map[string]KindSpec {
-	return map[string]KindSpec{
-		"telegram": {
-			Name: "telegram", RequiresToken: true, TargetFlag: "chat-id",
-			Open: openTelegram,
-		},
-		"whatsapp": {
-			Name: "whatsapp", Shared: true, TargetFlag: "group",
-			Open:       openWhatsapp,
-			OpenStream: openWhatsappStream,
-		},
-		"webhook": {
-			Name: "webhook", RequiresToken: true,
-			Open: openWebhook,
-		},
+// kinds is the mutable kind registry. Built-ins register in init(); a new kind
+// (teams, slack, …) is ONE file implementing Channel (+ Pushed or a Streamer) plus a
+// Register call — never a parallel registry.
+var (
+	kindsMu sync.RWMutex
+	kinds   = map[string]KindSpec{}
+)
+
+// Register adds a kind to the registry. A duplicate name panics (init-order bug).
+func Register(spec KindSpec) {
+	kindsMu.Lock()
+	defer kindsMu.Unlock()
+	if spec.Name == "" || spec.Open == nil {
+		panic("channel: Register needs Name and Open")
 	}
+	if _, dup := kinds[spec.Name]; dup {
+		panic(fmt.Sprintf("channel: kind %q registered twice", spec.Name))
+	}
+	kinds[spec.Name] = spec
+}
+
+func init() {
+	Register(KindSpec{
+		Name: "telegram", RequiresToken: true, TargetFlag: "chat-id",
+		Open: openTelegram,
+		Test: testTelegram,
+	})
+	Register(KindSpec{
+		Name: "whatsapp", Shared: true, TargetFlag: "group",
+		Open:       openWhatsapp,
+		OpenStream: openWhatsappStream,
+		Test:       testWhatsapp,
+	})
+	Register(KindSpec{
+		Name: "webhook", RequiresToken: true,
+		Open: openWebhook,
+		Test: testWebhook,
+	})
+}
+
+// Kinds returns a snapshot of the registry, keyed by canonical name.
+func Kinds() map[string]KindSpec {
+	kindsMu.RLock()
+	defer kindsMu.RUnlock()
+	out := make(map[string]KindSpec, len(kinds))
+	for k, v := range kinds {
+		out[k] = v
+	}
+	return out
 }
 
 // KindNames returns the canonical kind names, sorted.

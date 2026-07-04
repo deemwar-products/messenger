@@ -38,6 +38,9 @@ send(channel, text, --to thread, --reply-to id) → delivered, returns provider 
   - `messenger channel connect <name>` — whatsapp: reports "already linked (<jid>)" +
     lists groups, or runs the ONE-time QR pair; telegram: prints the `setWebhook` call
     (`--public-url https://host`, token referenced by NAME only).
+  - `messenger channel test [<name>]` — probe connectivity WITHOUT sending: whatsapp =
+    device linked + group known; telegram = `getMe` (token by NAME, prints the bot
+    username); webhook = secret resolvable. No name = test every channel.
 - **subscriptions — durable consumer delivery:**
   - `messenger subscribe add <name> --url URL [--channels a,b] [--secret-env NAME]` —
     every envelope is POSTed in order; the consumer's cursor advances only on 2xx, so a
@@ -59,6 +62,13 @@ wacli `--quote`, webhook → echoed. `/send` returns YOUR message's id, so you c
 onto your own sends.
 
 ## Rules
+
+- **ONE hub per host — always reuse.** Before starting anything, `messenger status`
+  (or `GET /health` → `{"service":"messenger"}`). If a hub is running, talk to it over
+  HTTP; never start a second `serve` — it would split telegram webhooks and whatsapp
+  streams. `serve` itself refuses to double-start on the same addr.
+- **Install this skill from any binary:** `messenger install --skills` (embedded copy,
+  no repo checkout needed).
 
 - **Secrets are use-only.** Reference by env-var NAME (`TELEGRAM_BOT_TOKEN`,
   `MESSENGER_HOOK_SECRET`, `MESSENGER_SERVE_TOKEN`); never print, log, or bake a value.

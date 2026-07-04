@@ -40,7 +40,9 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "channels": s.rt.Channels()})
+	// "service" self-identifies the hub so the single-instance probe (and any client)
+	// can tell a running messenger from an unrelated server on the same port.
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "service": "messenger", "channels": s.rt.Channels()})
 }
 
 // sendReq is the POST /send body: channel + text, with optional to (thread/chat/group)

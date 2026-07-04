@@ -26,9 +26,19 @@ messenger channel add telegram mybot --token-env TELEGRAM_BOT_TOKEN --chat-id -1
 messenger channel add webhook incoming --token-env MESSENGER_HOOK_SECRET
 messenger channel connect ops                # whatsapp: QR pair ONCE per host (or "already linked")
 messenger subscribe add factory --url http://localhost:9000/hook --channels mybot,ops
-messenger serve                              # everything on :14310
+messenger channel test                       # probe every channel (device, getMe, secrets)
+messenger serve                              # everything on :14310 (reuses a running hub)
 messenger status                             # one-glance health
+messenger install --skills                   # drop the embedded agent skill into ~/.claude/skills
 ```
+
+**One hub per host:** `serve` probes the address first and reuses an already-running
+messenger instead of double-starting — a second instance would split telegram webhooks
+and spawn a competing whatsapp stream. Every install/agent talks to the one hub over HTTP.
+
+**Extensible:** a new kind (teams, slack, …) is one file implementing `channel.Channel`
+plus a `channel.Register(KindSpec{...})` — CLI, runtime, `/send`, subscriptions, and
+threading work unchanged. See `docs/SPEC.md`.
 
 ## Channel kinds
 

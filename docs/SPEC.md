@@ -94,6 +94,22 @@ Wizard behavior: every verb prints the next step. `channel add whatsapp` checks
 wacli + pairing and says exactly what to do; `connect` is idempotent; `status`
 is the one-glance health view.
 
+## Single instance per host
+
+One hub owns the host's channels: a second `serve` would split telegram webhook
+delivery and spawn a competing wacli stream. `serve`/`listen` probe the address first
+(`GET /health` → `{"service":"messenger"}`) and reuse a running instance instead of
+double-starting. Multiple installs/agents all talk to the one hub over HTTP.
+
+## Extending with new kinds (teams, slack, …)
+
+A new kind is ONE file in `channel/`: a type implementing `Channel` (plus `Pushed` for
+HTTP-pushed inbound or a kind-level `Streamer` for long-lived streams), registered via
+`channel.Register(KindSpec{Name, Shared?, RequiresToken?, TargetFlag?, Open, OpenStream?,
+Test?})`. The CLI (`channel add/list/connect/test`), the runtime supervision, `/send`,
+subscriptions, and threading all work unchanged — no parallel registries, no server or
+CLI edits beyond kind-specific connect/test hints.
+
 ## Invariants
 
 - Single static binary, CGO_ENABLED=0, pure-Go deps only.

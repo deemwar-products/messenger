@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -36,6 +37,7 @@ import (
 	"github.com/deemwar-products/messenger/home"
 	"github.com/deemwar-products/messenger/inbox"
 	"github.com/deemwar-products/messenger/server"
+	"github.com/deemwar-products/messenger/skills"
 	"github.com/deemwar-products/messenger/subscription"
 )
 
@@ -60,6 +62,8 @@ func main() {
 		err = cmdSend(os.Args[2:])
 	case "serve":
 		err = cmdServe(os.Args[2:])
+	case "install":
+		err = cmdInstall(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -84,6 +88,8 @@ usage:
   messenger channel add whatsapp <name> [--group <group-jid>]     (device is global)
   messenger channel add webhook  <name> --token-env NAME
   messenger channel list | remove <name> | connect <name> [--public-url URL]
+  messenger channel test [<name>]          probe connectivity (whatsapp device, telegram getMe, webhook secret)
+  messenger install --skills               install the embedded agent skill into ~/.claude/skills
   messenger subscribe add <name> --url URL [--channels a,b] [--secret-env NAME]
   messenger subscribe list | remove <name>
   messenger listen [--addr :14310] [--webhook URL]
@@ -226,6 +232,11 @@ func cmdStatus(args []string) error {
 		return err
 	}
 	fmt.Printf("config: %s\n", path)
+	if probeRunning(":14310") {
+		fmt.Println("server: RUNNING on :14310 (reuse it — do not start a second instance)")
+	} else {
+		fmt.Println("server: not running on :14310 (start: messenger serve)")
+	}
 	fmt.Printf("channels: %d configured\n", len(cfg.Transports))
 	_ = channelListPrint(cfg)
 	printWhatsappHint()
@@ -284,6 +295,8 @@ func cmdChannel(args []string) error {
 		return channelRemove(rest)
 	case "connect":
 		return channelConnect(rest)
+	case "test":
+		return channelTest(rest)
 	default:
 		return fmt.Errorf("unknown channel subcommand %q", sub)
 	}
@@ -541,6 +554,122 @@ func connectWhatsapp(name string, t config.Transport) error {
 	return cmd.Run()
 }
 
+// channelTest probes connectivity per kind WITHOUT sending a message: whatsapp = global
+// device + group known; telegram = getMe with the token (by NAME); webhook = secret
+// resolvable. No name = test every configured channel. Never prints a secret value.
+func channelTest(args []string) error {
+	name := ""
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		name = args[0]
+		args = args[1:]
+	}
+	fs := flag.NewFlagSet("channel test", flag.ContinueOnError)
+	cfgPath := fs.String("config", "", "config path")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := loadConfig(*cfgPath)
+	if err != nil {
+		return err
+	}
+	targets := map[string]config.Transport{}
+	if name != "" {
+		t, ok := cfg.Transports[name]
+		if !ok {
+			return fmt.Errorf("no channel named %q", name)
+		}
+		targets[name] = t
+	} else {
+		targets = cfg.Transports
+	}
+	if len(targets) == 0 {
+		fmt.Println("no channels configured. add one: messenger channel add <kind> <name>")
+		return nil
+	}
+	res := channel.NewSecretResolver(nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	failed := 0
+	for _, n := range sortedKeys(targets) {
+		t := targets[n]
+		spec, err := channel.SpecFor(n, t)
+		if err != nil {
+			fmt.Printf("✗ %s: %v\n", n, err)
+			failed++
+			continue
+		}
+		if spec.Test == nil {
+			fmt.Printf("- %s (%s): nothing to test\n", n, spec.Name)
+			continue
+		}
+		lines, err := spec.Test(ctx, n, t, res)
+		if err != nil {
+			fmt.Printf("✗ %s (%s): %v\n", n, spec.Name, err)
+			failed++
+			continue
+		}
+		fmt.Printf("✓ %s (%s)\n", n, spec.Name)
+		for _, l := range lines {
+			fmt.Printf("    %s\n", l)
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d channel(s) failed the connectivity test", failed)
+	}
+	return nil
+}
+
+// cmdInstall installs binary-embedded assets. --skills drops the agent skill into the
+// agent skill directories so ANY installed messenger can enable agents to drive it.
+func cmdInstall(args []string) error {
+	fs := flag.NewFlagSet("install", flag.ContinueOnError)
+	skillsFlag := fs.Bool("skills", false, "install the embedded agent skill")
+	dir := fs.String("dir", "", "override the skill directory (default ~/.claude/skills)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if !*skillsFlag {
+		return fmt.Errorf("nothing to install — did you mean: messenger install --skills")
+	}
+	target := *dir
+	if target == "" {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		target = filepath.Join(homeDir, ".claude", "skills")
+	}
+	path, err := skills.Install(target)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("installed agent skill: %s\n", path)
+	fmt.Println("restart the agent session to pick it up.")
+	return nil
+}
+
+// probeRunning reports whether a messenger instance already answers on addr — the
+// single-instance guard: many installs/agents on one host REUSE the running hub
+// instead of double-binding channels (a second telegram webhook consumer or wacli
+// stream would split/steal messages).
+func probeRunning(addr string) bool {
+	hostport := addr
+	if strings.HasPrefix(hostport, ":") {
+		hostport = "127.0.0.1" + hostport
+	}
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + hostport + "/health")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	var h struct {
+		Service string `json:"service"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&h)
+	return h.Service == "messenger"
+}
+
 func envNameOr(name, fallback string) string {
 	if name != "" {
 		return name
@@ -689,6 +818,10 @@ func cmdListen(args []string) error {
 	if err != nil {
 		return err
 	}
+	if probeRunning(*addr) {
+		fmt.Printf("messenger already running on %s — reusing it; not starting a second ingress.\n", *addr)
+		return nil
+	}
 	box, err := inbox.Open(home.InboxPath())
 	if err != nil {
 		return err
@@ -760,6 +893,13 @@ func cmdServe(args []string) error {
 	cfg, err := loadConfig(*cfgPath)
 	if err != nil {
 		return err
+	}
+	// Single instance per host: if a messenger already answers here, reuse it — a second
+	// instance would double-bind channels (split telegram webhooks, a second wacli stream).
+	if probeRunning(*addr) {
+		fmt.Printf("messenger already running on %s — reusing it (POST /send, GET /inbox there).\n", *addr)
+		fmt.Println("to run a second isolated instance, pass a different --addr and $MESSENGER_HOME.")
+		return nil
 	}
 	box, err := inbox.Open(home.InboxPath())
 	if err != nil {
