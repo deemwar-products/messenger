@@ -1,7 +1,7 @@
 // Package skills embeds the portable agent skill so ANY installed messenger binary can
-// drop it into an agent's skill directory: `messenger install --skills`. The tracked
-// source of truth is skills/messenger/SKILL.md; install.sh remains for repo-based
-// symlink installs.
+// drop it into an agent's skill directory: `messenger install --skills`. The binary is
+// the ONLY installer — no shell scripts. The tracked source of truth is
+// skills/messenger/SKILL.md, compiled in at build time.
 package skills
 
 import (

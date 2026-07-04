@@ -80,5 +80,6 @@ WhatsApp-Web device) — no whatsmeow link-in.
 
 ## Agent skill
 
-`skills/messenger/SKILL.md` is a portable front door: `skills/install.sh` symlinks it
-into `~/.claude/skills` so an agent can drive messenger by intent.
+`skills/messenger/SKILL.md` is a portable front door, embedded in the binary. The
+binary installs its own skills — no scripts: `messenger install --skills` (add `--dir`
+to target another skill directory) so an agent can drive messenger by intent.

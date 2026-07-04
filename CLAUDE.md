@@ -28,7 +28,7 @@ webhook = every hook its own channel.
 | `subscription/` | durable consumer push: per-consumer cursor + retry + HMAC-signed delivery |
 | `inbox/` | append-only NDJSON inbound store + read-since (the delivery queue) |
 | `server/` | the `serve` HTTP surface |
-| `skills/` | the portable agent skill + `install.sh` |
+| `skills/` | the portable agent skill (embedded via go:embed; installed by the binary) |
 | `docs/SPEC.md` | the v2 spec (conversation-hub model) |
 
 ## Rules
@@ -56,5 +56,5 @@ CGO_ENABLED=0 go build -o messenger ./cmd/messenger
 CGO_ENABLED=0 go build ./... && go vet ./... && CGO_ENABLED=0 go test ./...   # green gate
 messenger setup && messenger status
 messenger serve
-skills/install.sh        # symlink the agent skill into ~/.claude/skills
+messenger install --skills   # the binary installs its own agent skill (no scripts)
 ```
