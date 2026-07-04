@@ -1,0 +1,8 @@
+# build output
+/dist/
+
+# per-machine env (secrets live here, never committed)
+.env
+
+# per-machine skill activation symlinks
+/.claude/
