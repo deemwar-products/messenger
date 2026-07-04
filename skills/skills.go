@@ -1,28 +1,38 @@
-// Package skills embeds the portable agent skill so ANY installed messenger binary can
-// drop it into an agent's skill directory: `messenger install --skills`. The binary is
-// the ONLY installer — no shell scripts. The tracked source of truth is
-// skills/messenger/SKILL.md, compiled in at build time.
+// Package skills embeds the portable agent skill (SKILL.md + references/) so ANY
+// installed messenger binary can drop it into an agent's skill directory:
+// `messenger install --skills`. The binary is the ONLY installer — no shell scripts.
+// The tracked source of truth is skills/messenger/, compiled in at build time.
 package skills
 
 import (
-	_ "embed"
+	"embed"
+	"io/fs"
 	"os"
 	"path/filepath"
 )
 
-//go:embed messenger/SKILL.md
-var skillMD []byte
+//go:embed messenger
+var skillFS embed.FS
 
-// Install writes the embedded skill to <dir>/messenger/SKILL.md (0644, dirs 0755) and
-// returns the written path. Idempotent: re-running overwrites with the binary's copy.
+// Install writes the embedded skill tree to <dir>/messenger/ (files 0644, dirs 0755)
+// and returns the SKILL.md path. Idempotent: re-running overwrites with the binary's copy.
 func Install(dir string) (string, error) {
-	dest := filepath.Join(dir, "messenger")
-	if err := os.MkdirAll(dest, 0o755); err != nil {
+	err := fs.WalkDir(skillFS, "messenger", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		dest := filepath.Join(dir, path)
+		if d.IsDir() {
+			return os.MkdirAll(dest, 0o755)
+		}
+		data, rerr := skillFS.ReadFile(path)
+		if rerr != nil {
+			return rerr
+		}
+		return os.WriteFile(dest, data, 0o644)
+	})
+	if err != nil {
 		return "", err
 	}
-	path := filepath.Join(dest, "SKILL.md")
-	if err := os.WriteFile(path, skillMD, 0o644); err != nil {
-		return "", err
-	}
-	return path, nil
+	return filepath.Join(dir, "messenger", "SKILL.md"), nil
 }
