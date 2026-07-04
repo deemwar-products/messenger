@@ -1,4 +1,4 @@
-package transport
+package channel
 
 import (
 	"bytes"
@@ -36,7 +36,7 @@ func NewVault(dir, keyPath string) *Vault { return &Vault{dir: dir, keyPath: key
 func (v *Vault) identities() ([]age.Identity, error) {
 	f, err := os.Open(v.keyPath)
 	if err != nil {
-		return nil, fmt.Errorf("transport: vault key: %w", err)
+		return nil, fmt.Errorf("channel: vault key: %w", err)
 	}
 	defer f.Close()
 	return age.ParseIdentities(f)
@@ -47,7 +47,7 @@ func (v *Vault) identities() ([]age.Identity, error) {
 // never its contents.
 func (v *Vault) Reveal(name string) (string, error) {
 	if name == "" {
-		return "", fmt.Errorf("transport: vault: empty entry name")
+		return "", fmt.Errorf("channel: vault: empty entry name")
 	}
 	ids, err := v.identities()
 	if err != nil {
@@ -55,15 +55,15 @@ func (v *Vault) Reveal(name string) (string, error) {
 	}
 	ct, err := os.ReadFile(filepath.Join(v.dir, name+".age"))
 	if err != nil {
-		return "", fmt.Errorf("transport: vault entry %q: %w", name, err)
+		return "", fmt.Errorf("channel: vault entry %q: %w", name, err)
 	}
 	r, err := age.Decrypt(bytes.NewReader(ct), ids...)
 	if err != nil {
-		return "", fmt.Errorf("transport: vault entry %q: decrypt failed", name)
+		return "", fmt.Errorf("channel: vault entry %q: decrypt failed", name)
 	}
 	pt, err := io.ReadAll(r)
 	if err != nil {
-		return "", fmt.Errorf("transport: vault entry %q: read failed", name)
+		return "", fmt.Errorf("channel: vault entry %q: read failed", name)
 	}
 	return strings.TrimRight(string(pt), "\n"), nil
 }
@@ -122,9 +122,9 @@ func (s *SecretResolver) resolve(what, vaultName, envName string) (string, error
 	if envName != "" {
 		val := os.Getenv(envName)
 		if val == "" {
-			return "", fmt.Errorf("transport: %s secret: env %q is unset", what, envName)
+			return "", fmt.Errorf("channel: %s secret: env %q is unset", what, envName)
 		}
 		return val, nil
 	}
-	return "", fmt.Errorf("transport: %s secret: no source (set tokenVault or tokenEnv)", what)
+	return "", fmt.Errorf("channel: %s secret: no source (set tokenVault or tokenEnv)", what)
 }

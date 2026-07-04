@@ -1,66 +1,74 @@
 # messenger
 
-Standalone, **broker-free channel I/O** as one static Go binary. It owns receiving and
-sending messages over **telegram**, **whatsapp**, and a generic **HMAC hook**, so any
-product (a trading desk, an agent OS, a script) consumes it over plain HTTP — no broker to
-run. Every message is a self-describing **Envelope**, so replies **thread** to a specific
-message.
+Broker-free **conversation hub** as one static Go binary. It owns receiving and sending
+messages over **telegram**, **whatsapp**, and generic **webhook** channels, and delivers
+inbound messages to N consumers with durable per-consumer cursors — so any product (a
+trading desk, an agent OS, a script) plugs in over plain HTTP. No broker. The CLI is the
+whole interface. Full design: `docs/SPEC.md`.
 
 ```
-inbound: telegram/whatsapp/hook → Envelope {id,channel,from,thread_id,reply_to,text,ts}
-         → inbox.ndjson (+ optional webhook push)
-outbound: send(channel, text, --to thread, --reply-to id) → matching adapter → delivered
+ports (channels)           hub                       consumers (subscriptions)
+telegram bot A ─┐                                     ┌─> factory    POST url (own cursor)
+telegram bot B ─┤→ Envelope → inbox.ndjson ─────────→ ├─> cryptodesk POST url (own cursor)
+whatsapp device ┤   {id, channel, sender, text,       └─> ad-hoc: GET /inbox?since=N
+webhook hooks  ─┘    thread_id, reply_to, ts}
+                 ← POST /send {channel,text,to,reply_to} → returns the provider message id
 ```
 
 ## Quick start
 
 ```sh
-task setup                 # scaffold ~/.config/messenger/config.toml (empty) + home
-cp .env.example .env       # fill in the secret VALUES (gitignored, never committed)
+go build -o messenger ./cmd/messenger        # CGO_ENABLED=0, single static binary
 
-# add channels — many of any kind, each keyed by its own name:
-messenger channel add whatsapp home
+messenger setup                              # scaffold ~/.config/messenger + guide
+messenger channel add whatsapp ops --group 123456789@g.us
 messenger channel add telegram mybot --token-env TELEGRAM_BOT_TOKEN --chat-id -1001234567890
-messenger channel add hook incoming --token-env MESSENGER_HOOK_SECRET
-messenger channel list
-messenger channel connect mybot --public-url https://<host>   # setWebhook / wacli pair
-
-task serve                 # channel webhooks + POST /send, GET /inbox, GET /health
+messenger channel add webhook incoming --token-env MESSENGER_HOOK_SECRET
+messenger channel connect ops                # whatsapp: QR pair ONCE per host (or "already linked")
+messenger subscribe add factory --url http://localhost:9000/hook --channels mybot,ops
+messenger serve                              # everything on :14310
+messenger status                             # one-glance health
 ```
 
-Everything is **task-driven** and env comes from `.env` via the Taskfile — never the
-ambient shell. `task -l` lists all verbs.
+## Channel kinds
 
-## Verbs
+| kind | multiplicity | notes |
+|------|--------------|-------|
+| `telegram` | many channels, each its OWN bot | own `--token-env`, default `--chat-id` |
+| `whatsapp` | ONE global paired device; each channel = a GROUP | `--group <jid>` binds the channel to a group; ONE wacli stream serves them all; a channel with no group is the catch-all; `connect` detects an already-linked device and lists groups |
+| `webhook` | many channels, each its own hook | HMAC-signed inbound on `/webhook/<name>` (legacy `/hook/<name>` still answers), signed outbound to `callbackURL` |
 
-| verb | what |
-|------|------|
-| `task setup` | scaffold an empty config + home |
-| `messenger channel add/list/remove/connect` | manage channels (many of any kind, keyed by name) |
-| `task serve` | HTTP server: `/health`, `POST /send`, `GET /inbox?since=N`, + channel webhooks |
-| `task listen` | ingress only: append inbound to the inbox; optional `--webhook URL` push |
-| `task send -- --channel telegram --text "hi" --to 123 --reply-to 42` | one-shot egress, threaded |
-| `task install-skill` | symlink the agent skill into `~/.claude/skills` |
+## Subscriptions (durable consumer delivery)
 
-## HTTP API
+`messenger subscribe add <name> --url URL [--channels a,b] [--secret-env NAME]` — every
+inbound envelope is POSTed in order to the URL; the per-consumer cursor
+(`$MESSENGER_HOME/cursors/<name>`) advances only on 2xx, so a consumer that was down
+catches up. At-least-once, retried with backoff. Pushes are HMAC-signed
+(`X-Messenger-Signature-256`) when `--secret-env` names a secret.
 
-- `POST /send` — `{channel, text, to?, reply_to?}` (bearer-auth when `serveTokenEnv` set)
+## HTTP API (`messenger serve`)
+
+- `POST /send` — `{channel, text, to?, reply_to?}` → `{ok, id}` where `id` is the
+  provider message id (bearer-auth when `serveTokenEnv` set)
 - `GET /inbox?since=N` — `{messages, next}`; `N` is a 1-based offset, pass `next` back
-- `GET /health` — `{ok, channels}`
+- `GET /health` — `{ok, channels: {name: kind}}`
 
 ## Threaded replies
 
 Each inbound Envelope carries a stable `id` (telegram `message_id`, wacli id, or minted)
-and a `thread_id`. To answer *that* message, pass its `id` as `reply_to` — telegram uses
-`reply_to_message_id`, whatsapp uses wacli `--quote`, hook echoes `reply_to` to the callback.
+and a `thread_id` (telegram chat id / whatsapp group JID). To answer *that* message pass
+its `id` as `reply_to` — telegram uses `reply_to_message_id`, whatsapp uses wacli
+`--quote`, webhook echoes it. `/send` returns the id of YOUR outbound message, so
+consumers can thread onto their own sends too.
 
 ## Secrets
 
 Referenced by **NAME** only (`TELEGRAM_BOT_TOKEN`, `MESSENGER_HOOK_SECRET`,
-`MESSENGER_SERVE_TOKEN`). A value lives only in `.env`/vault, never in `config.toml`, code,
-logs, or output. WhatsApp shells `wacli` (a paired WhatsApp-Web device) — no whatsmeow link-in.
+`MESSENGER_SERVE_TOKEN`). A value lives only in the process environment or the age
+vault, never in `config.toml`, code, logs, or output. WhatsApp shells `wacli` (a paired
+WhatsApp-Web device) — no whatsmeow link-in.
 
 ## Agent skill
 
-`skills/messenger/SKILL.md` is a portable front door: `task install-skill` symlinks it into
-`~/.claude/skills` so an agent can drive messenger by intent. Restart the session to pick it up.
+`skills/messenger/SKILL.md` is a portable front door: `skills/install.sh` symlinks it
+into `~/.claude/skills` so an agent can drive messenger by intent.

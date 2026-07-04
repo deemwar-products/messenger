@@ -20,6 +20,19 @@ type Config struct {
 	ServeTokenEnv string `toml:"serveTokenEnv,omitempty"`
 	// Transports maps a channel name (also the Envelope Channel) to its connection config.
 	Transports map[string]Transport `toml:"transports,omitempty"`
+	// Subscriptions maps a consumer name to its durable push subscription.
+	Subscriptions map[string]Subscription `toml:"subscriptions,omitempty"`
+}
+
+// Subscription is one consumer's durable push registration: every inbound envelope
+// (optionally filtered to Channels) is POSTed to URL in order, advancing a per-consumer
+// cursor only on success — a consumer that was down catches up. SecretEnv names the env
+// var whose value HMAC-signs each push (X-Messenger-Signature-256); never a value here.
+type Subscription struct {
+	Enabled   bool     `toml:"enabled"`
+	URL       string   `toml:"url"`
+	Channels  []string `toml:"channels,omitempty"`  // empty = all channels
+	SecretEnv string   `toml:"secretEnv,omitempty"` // NAME of the env var holding the signing secret
 }
 
 // Transport is one channel's connection config. Kind selects the adapter (defaults to
@@ -47,6 +60,9 @@ func Load(path string) (*Config, error) {
 	}
 	if c.Transports == nil {
 		c.Transports = map[string]Transport{}
+	}
+	if c.Subscriptions == nil {
+		c.Subscriptions = map[string]Subscription{}
 	}
 	return &c, nil
 }

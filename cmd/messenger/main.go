@@ -1,13 +1,14 @@
-// Command messenger is the standalone, broker-free channel I/O product: one static
-// binary with three verbs.
+// Command messenger is the standalone, broker-free conversation hub: one static binary,
+// the CLI is the whole interface.
 //
-//	messenger listen   run the enabled channel transports; append each inbound message to
-//	                   the inbox and optionally POST it to a subscriber webhook. Pushed
-//	                   channels (telegram/hook) are served on --addr.
-//	messenger send     one-shot egress: deliver a message on a channel, optionally
-//	                   threading a reply (--to <thread> --reply-to <message id>).
-//	messenger serve    the small HTTP server: channel webhooks + the consumer API
-//	                   (POST /send, GET /inbox?since=N, GET /health) on one --addr.
+//	messenger setup      scaffold home + an empty config, then guide channel adds
+//	messenger status     one-glance health: config, channels, whatsapp device, inbox, subs
+//	messenger channel    add / list / remove / connect (wizard-grade; whatsapp device is global)
+//	messenger subscribe  add / list / remove durable consumer push subscriptions
+//	messenger listen     ingress + subscription dispatch (no consumer API)
+//	messenger send       one-shot egress; prints the provider-assigned message id
+//	messenger serve      everything on one port: channel webhooks + POST /send,
+//	                     GET /inbox?since=N, GET /health + the subscription dispatcher
 //
 // Config lives at $MESSENGER_HOME/config.toml (or ~/.config/messenger/config.toml).
 // Secrets are referenced by NAME only and resolved host-only at the point of use.
@@ -29,12 +30,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/deemwar-products/messenger/channel"
 	"github.com/deemwar-products/messenger/config"
 	"github.com/deemwar-products/messenger/envelope"
 	"github.com/deemwar-products/messenger/home"
 	"github.com/deemwar-products/messenger/inbox"
 	"github.com/deemwar-products/messenger/server"
-	"github.com/deemwar-products/messenger/transport"
+	"github.com/deemwar-products/messenger/subscription"
 )
 
 func main() {
@@ -46,8 +48,12 @@ func main() {
 	switch os.Args[1] {
 	case "setup":
 		err = cmdSetup(os.Args[2:])
+	case "status":
+		err = cmdStatus(os.Args[2:])
 	case "channel", "channels":
 		err = cmdChannel(os.Args[2:])
+	case "subscribe", "subscription", "subscriptions":
+		err = cmdSubscribe(os.Args[2:])
 	case "listen":
 		err = cmdListen(os.Args[2:])
 	case "send":
@@ -69,28 +75,28 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `messenger — standalone channel I/O (telegram, whatsapp, hook)
+	fmt.Fprint(os.Stderr, `messenger — broker-free conversation hub (telegram, whatsapp, webhook)
 
 usage:
-  messenger setup                       scaffold home + an empty config
-  messenger channel add <kind> <name>   add a channel (kind: telegram|whatsapp|hook)
-  messenger channel list                list configured channels
-  messenger channel remove <name>       remove a channel
-  messenger channel connect <name>      connect/pair a channel (wacli auth / telegram setWebhook)
+  messenger setup                          scaffold home + an empty config, then guide
+  messenger status                         config + channels + whatsapp device + inbox + subs
+  messenger channel add telegram <name> --token-env NAME [--chat-id ID]
+  messenger channel add whatsapp <name> [--group <group-jid>]     (device is global)
+  messenger channel add webhook  <name> --token-env NAME
+  messenger channel list | remove <name> | connect <name> [--public-url URL]
+  messenger subscribe add <name> --url URL [--channels a,b] [--secret-env NAME]
+  messenger subscribe list | remove <name>
   messenger listen [--addr :14310] [--webhook URL]
   messenger send   --channel <name> --text "hi" [--to THREAD] [--reply-to MSGID]
   messenger serve  [--addr :14310]
 
-channel add flags:
-  --token-env NAME    env var holding the token (telegram bot token, hook secret)
-  --chat-id ID        default target chat/channel id (telegram: the channel to post to)
-  --account NAME      platform account/workspace label
-  --token-vault NAME  age vault entry holding the token (instead of --token-env)
-  --option k=v        repeatable free-form option (e.g. --option bin=wacli)
-  --disabled          add the channel disabled
+kinds:
+  telegram  many channels, each its OWN bot (own --token-env) + default --chat-id
+  whatsapp  ONE global paired device; each channel = a GROUP (--group <jid>);
+            one channel with no --group is the catch-all for unmatched chats
+  webhook   many channels, each its own HMAC-signed path (/webhook/<name>) + secret
 
-  e.g.  messenger channel add whatsapp home
-        messenger channel add telegram mybot --token-env TELEGRAM_BOT_TOKEN --chat-id -1001234567890
+secrets are referenced by NAME only (--token-env / --token-vault) — never a value.
 `)
 }
 
@@ -107,9 +113,163 @@ func (o optionFlags) Set(v string) error {
 	return nil
 }
 
-// cmdChannel is the channel management group: add / list / remove / connect. All edits
-// write config.toml; secrets are referenced by NAME only (--token-env / --token-vault),
-// never a value.
+func loadConfig(path string) (*config.Config, error) {
+	if path == "" {
+		path = home.ConfigPath()
+	}
+	return config.Load(path)
+}
+
+// loadOrInitConfig loads the config, scaffolding an empty one when absent.
+func loadOrInitConfig(path string) (*config.Config, string, error) {
+	if path == "" {
+		path = home.ConfigPath()
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return nil, path, err
+		}
+		cfg = &config.Config{
+			ServeTokenEnv: "MESSENGER_SERVE_TOKEN",
+			Transports:    map[string]config.Transport{},
+			Subscriptions: map[string]config.Subscription{},
+		}
+	}
+	return cfg, path, nil
+}
+
+func saveConfig(path string, cfg *config.Config) error {
+	if err := os.MkdirAll(home.Dir(), 0o700); err != nil {
+		return err
+	}
+	return config.Save(path, cfg)
+}
+
+// --- setup / status ---------------------------------------------------------------------
+
+// cmdSetup scaffolds the home directory and an empty config.toml (idempotent unless
+// --force), then guides the next steps — including the global whatsapp device state.
+func cmdSetup(args []string) error {
+	fs := flag.NewFlagSet("setup", flag.ContinueOnError)
+	cfgPath := fs.String("config", "", "config path (default $MESSENGER_HOME/config.toml)")
+	force := fs.Bool("force", false, "overwrite an existing config")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	path := *cfgPath
+	if path == "" {
+		path = home.ConfigPath()
+	}
+	if err := os.MkdirAll(home.Dir(), 0o700); err != nil {
+		return err
+	}
+	if _, err := os.Stat(path); err == nil && !*force {
+		fmt.Printf("config already exists at %s (use --force to reset)\n", path)
+	} else {
+		empty := &config.Config{ServeTokenEnv: "MESSENGER_SERVE_TOKEN", Transports: map[string]config.Transport{}}
+		if err := config.Save(path, empty); err != nil {
+			return err
+		}
+		fmt.Printf("scaffolded home + empty config at %s\n", path)
+	}
+	printWhatsappHint()
+	fmt.Print(`
+next — add channels (many of any kind, keyed by name):
+  messenger channel add whatsapp ops --group 123456789@g.us
+  messenger channel add telegram mybot --token-env TELEGRAM_BOT_TOKEN --chat-id -1001234567890
+  messenger channel add webhook incoming --token-env MESSENGER_HOOK_SECRET
+then:
+  messenger channel list
+  messenger channel connect <name>     # whatsapp QR pair (once per host) / telegram setWebhook
+  messenger subscribe add factory --url http://localhost:9000/hook
+  messenger serve                      # webhooks + /send + /inbox + subscription push
+secrets are referenced by NAME only — export the values, never printed here.
+`)
+	return nil
+}
+
+// printWhatsappHint reports the GLOBAL device state so the user knows whether pairing
+// is even needed.
+func printWhatsappHint() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	st := channel.WhatsappDeviceStatus(ctx, "")
+	switch {
+	case !st.Installed:
+		fmt.Println("whatsapp: wacli not found on PATH — install it to use whatsapp channels")
+	case st.Authenticated:
+		fmt.Printf("whatsapp: device already linked (%s) — no pairing needed, just add group channels\n", st.LinkedJID)
+	default:
+		fmt.Println("whatsapp: wacli installed but not paired — `messenger channel connect <name>` will run the QR pair once")
+	}
+}
+
+// cmdStatus is the one-glance health view: config path, channels, the global whatsapp
+// device, inbox size, and subscriptions with their cursors.
+func cmdStatus(args []string) error {
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	cfgPath := fs.String("config", "", "config path")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	path := *cfgPath
+	if path == "" {
+		path = home.ConfigPath()
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Printf("no config at %s — run: messenger setup\n", path)
+			return nil
+		}
+		return err
+	}
+	fmt.Printf("config: %s\n", path)
+	fmt.Printf("channels: %d configured\n", len(cfg.Transports))
+	_ = channelListPrint(cfg)
+	printWhatsappHint()
+
+	if msgs, next, err := (&inboxAt{home.InboxPath()}).count(); err == nil {
+		fmt.Printf("inbox: %d messages (%s)\n", next, home.InboxPath())
+		_ = msgs
+	}
+	if len(cfg.Subscriptions) > 0 {
+		fmt.Printf("subscriptions:\n")
+		names := sortedKeys(cfg.Subscriptions)
+		for _, n := range names {
+			s := cfg.Subscriptions[n]
+			cur := readCursorFile(home.Path("cursors", n))
+			fmt.Printf("  %-16s enabled=%-5v cursor=%-6d url=%s channels=%s\n",
+				n, s.Enabled, cur, s.URL, strings.Join(s.Channels, ","))
+		}
+	}
+	return nil
+}
+
+type inboxAt struct{ path string }
+
+func (i *inboxAt) count() (int, int, error) {
+	box, err := inbox.Open(i.path)
+	if err != nil {
+		return 0, 0, err
+	}
+	msgs, next, err := box.Since(0)
+	return len(msgs), next, err
+}
+
+func readCursorFile(path string) int {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	var n int
+	_, _ = fmt.Sscanf(strings.TrimSpace(string(b)), "%d", &n)
+	return n
+}
+
+// --- channel management -------------------------------------------------------------------
+
 func cmdChannel(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: messenger channel <add|list|remove|connect> ...")
@@ -139,25 +299,33 @@ func channelList(args []string) error {
 	if err != nil {
 		return err
 	}
+	return channelListPrint(cfg)
+}
+
+func channelListPrint(cfg *config.Config) error {
 	if len(cfg.Transports) == 0 {
 		fmt.Println("no channels configured. add one: messenger channel add <kind> <name>")
 		return nil
 	}
-	names := make([]string, 0, len(cfg.Transports))
-	for n := range cfg.Transports {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	fmt.Printf("%-16s %-10s %-8s %s\n", "NAME", "KIND", "ENABLED", "TARGET/OPTIONS")
+	names := sortedKeys(cfg.Transports)
+	fmt.Printf("%-16s %-10s %-8s %s\n", "NAME", "KIND", "ENABLED", "TARGET")
 	for _, n := range names {
 		t := cfg.Transports[n]
-		kind := t.Kind
-		if kind == "" {
-			kind = n
-		}
+		kind := channel.NormalizeKind(t.Kind, n)
 		detail := ""
-		if id := t.Options["chatId"]; id != "" {
-			detail = "chat=" + id
+		switch {
+		case t.Options["group"] != "":
+			detail = "group=" + t.Options["group"]
+		case t.Options["chatId"] != "":
+			detail = "chat=" + t.Options["chatId"]
+		case kind == "whatsapp":
+			detail = "(catch-all: unmatched chats land here)"
+		case kind == "webhook":
+			p := t.Options["path"]
+			if p == "" {
+				p = "/webhook/" + n
+			}
+			detail = "path=" + p
 		}
 		fmt.Printf("%-16s %-10s %-8v %s\n", n, kind, t.Enabled, detail)
 	}
@@ -170,44 +338,40 @@ func channelAdd(args []string) error {
 	if len(args) < 2 {
 		return fmt.Errorf("usage: messenger channel add <kind> <name> [flags]")
 	}
-	kind, name := args[0], args[1]
+	kind, name := channel.NormalizeKind(args[0], args[0]), args[1]
 	fs := flag.NewFlagSet("channel add", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "config path")
-	tokenEnv := fs.String("token-env", "", "env var NAME holding the token")
+	tokenEnv := fs.String("token-env", "", "env var NAME holding the token/secret")
 	tokenVault := fs.String("token-vault", "", "age vault entry NAME holding the token")
 	account := fs.String("account", "", "platform account/workspace label")
-	chatID := fs.String("chat-id", "", "default target chat/channel id")
+	chatID := fs.String("chat-id", "", "telegram: default target chat/channel id")
+	group := fs.String("group", "", "whatsapp: the group JID this channel is bound to")
 	disabled := fs.Bool("disabled", false, "add the channel disabled")
 	opts := optionFlags{}
 	fs.Var(&opts, "option", "repeatable free-form option k=v")
 	if err := fs.Parse(args[2:]); err != nil {
 		return err
 	}
-	switch kind {
-	case "telegram", "whatsapp", "hook":
-	default:
-		return fmt.Errorf("unknown kind %q (telegram|whatsapp|hook)", kind)
+	spec, ok := channel.Kinds()[kind]
+	if !ok {
+		return fmt.Errorf("unknown kind %q (%s)", args[0], strings.Join(channel.KindNames(), "|"))
+	}
+	if spec.RequiresToken && *tokenEnv == "" && *tokenVault == "" {
+		return fmt.Errorf("%s channels need a secret: pass --token-env NAME (or --token-vault)", kind)
 	}
 
-	path := *cfgPath
-	if path == "" {
-		path = home.ConfigPath()
-	}
-	cfg, err := config.Load(path)
+	cfg, path, err := loadOrInitConfig(*cfgPath)
 	if err != nil {
-		if !os.IsNotExist(err) {
-			return err
-		}
-		cfg = &config.Config{Transports: map[string]config.Transport{}}
-	}
-	if cfg.Transports == nil {
-		cfg.Transports = map[string]config.Transport{}
+		return err
 	}
 	if _, exists := cfg.Transports[name]; exists {
 		return fmt.Errorf("channel %q already exists (remove it first)", name)
 	}
 	if *chatID != "" {
 		opts["chatId"] = *chatID
+	}
+	if *group != "" {
+		opts["group"] = *group
 	}
 	if len(opts) == 0 {
 		opts = nil
@@ -220,20 +384,46 @@ func channelAdd(args []string) error {
 		TokenVault: *tokenVault,
 		Options:    opts,
 	}
-	if err := os.MkdirAll(home.Dir(), 0o700); err != nil {
-		return err
-	}
-	if err := config.Save(path, cfg); err != nil {
+	if err := saveConfig(path, cfg); err != nil {
 		return err
 	}
 	fmt.Printf("added channel %q (kind=%s, enabled=%v) to %s\n", name, kind, !*disabled, path)
 	if *tokenEnv != "" {
 		fmt.Printf("  remember to export %s (value never printed)\n", *tokenEnv)
 	}
-	if kind == "whatsapp" {
-		fmt.Printf("  pair once: messenger channel connect %s\n", name)
+	switch kind {
+	case "whatsapp":
+		// The device is GLOBAL — say whether pairing is even needed, and nudge toward
+		// a group binding when none was given.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		st := channel.WhatsappDeviceStatus(ctx, waBinOf(cfg.Transports[name]))
+		switch {
+		case !st.Installed:
+			fmt.Println("  wacli not found on PATH — install it, then: messenger channel connect " + name)
+		case st.Authenticated:
+			fmt.Printf("  device already linked (%s) — no pairing needed\n", st.LinkedJID)
+		default:
+			fmt.Printf("  pair the device once (serves ALL whatsapp channels): messenger channel connect %s\n", name)
+		}
+		if *group == "" {
+			fmt.Println("  no --group set: this channel is the catch-all. bind a group with:")
+			fmt.Printf("    messenger channel connect %s     # lists your groups + their JIDs\n", name)
+		}
+	case "telegram":
+		fmt.Printf("  register the webhook: messenger channel connect %s --public-url https://<host>\n", name)
+	case "webhook":
+		p := opts["path"]
+		if p == "" {
+			p = "/webhook/" + name
+		}
+		fmt.Printf("  inbound path: %s (HMAC X-Hub-Signature-256 with $%s)\n", p, *tokenEnv)
 	}
 	return nil
+}
+
+func waBinOf(t config.Transport) string {
+	return t.Options["bin"] // "" lets the probe default to wacli
 }
 
 func channelRemove(args []string) error {
@@ -265,9 +455,11 @@ func channelRemove(args []string) error {
 	return nil
 }
 
-// channelConnect performs the connect/pair action for a channel: whatsapp runs the
-// paired-device auth (wacli auth); telegram prints the setWebhook to run against a public
-// URL; hook needs no connect. It never handles a secret value directly.
+// channelConnect performs the connect/pair action for a channel. whatsapp is GLOBAL:
+// if the device is already linked it reports the JID and lists the groups (so the user
+// can bind --group JIDs) instead of re-pairing; only an unlinked device runs `wacli
+// auth` (QR) — once, for all whatsapp channels. telegram prints the setWebhook to run
+// against a public URL; webhook prints a signed-call example. Never handles a secret value.
 func channelConnect(args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: messenger channel connect <name>")
@@ -287,20 +479,10 @@ func channelConnect(args []string) error {
 	if !ok {
 		return fmt.Errorf("no channel named %q", name)
 	}
-	kind := t.Kind
-	if kind == "" {
-		kind = name
-	}
+	kind := channel.NormalizeKind(t.Kind, name)
 	switch kind {
 	case "whatsapp":
-		bin := t.Options["bin"]
-		if bin == "" {
-			bin = "wacli"
-		}
-		fmt.Printf("pairing whatsapp %q via %s auth — scan the QR:\n", name, bin)
-		cmd := exec.Command(bin, "auth")
-		cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
-		return cmd.Run()
+		return connectWhatsapp(name, t)
 	case "telegram":
 		path := t.Options["path"]
 		if path == "" {
@@ -315,10 +497,48 @@ func channelConnect(args []string) error {
 		fmt.Printf("  curl -sS \"https://api.telegram.org/bot$%s/setWebhook\" -d \"url=%s%s\"\n",
 			envNameOr(t.TokenEnv, "TELEGRAM_BOT_TOKEN"), strings.TrimRight(*publicURL, "/"), path)
 		return nil
+	case "webhook":
+		p := t.Options["path"]
+		if p == "" {
+			p = "/webhook/" + name
+		}
+		fmt.Printf("webhook %q needs no pairing. callers POST to %s signed with $%s:\n", name, p, envNameOr(t.TokenEnv, "MESSENGER_HOOK_SECRET"))
+		fmt.Printf("  sig=\"sha256=$(printf '%%s' \"$BODY\" | openssl dgst -sha256 -hmac \"$%s\" -hex | awk '{print $NF}')\"\n", envNameOr(t.TokenEnv, "MESSENGER_HOOK_SECRET"))
+		fmt.Printf("  curl -sS -X POST \"http://<host>%s\" -H \"X-Hub-Signature-256: $sig\" -d \"$BODY\"\n", p)
+		return nil
 	default:
 		fmt.Printf("channel %q (kind=%s) needs no connect step\n", name, kind)
 		return nil
 	}
+}
+
+// connectWhatsapp is the wizard for the ONE global device: already linked → report +
+// list groups; not linked → run the interactive QR pair.
+func connectWhatsapp(name string, t config.Transport) error {
+	bin := t.Options["bin"]
+	if bin == "" {
+		bin = "wacli"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	st := channel.WhatsappDeviceStatus(ctx, bin)
+	if !st.Installed {
+		return fmt.Errorf("wacli not found on PATH — install it first (https://wacli.sh)")
+	}
+	if st.Authenticated {
+		fmt.Printf("whatsapp device already linked (%s) — serves every whatsapp channel, no re-pair needed.\n", st.LinkedJID)
+		fmt.Println("known groups (bind one with: messenger channel add whatsapp <name> --group <jid>):")
+		cmd := exec.Command(bin, "groups", "list")
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Println("  (could not list groups — run `wacli groups list` after a sync)")
+		}
+		return nil
+	}
+	fmt.Printf("pairing the global whatsapp device via %s auth — scan the QR (once per host):\n", bin)
+	cmd := exec.Command(bin, "auth")
+	cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
+	return cmd.Run()
 }
 
 func envNameOr(name, fallback string) string {
@@ -328,60 +548,140 @@ func envNameOr(name, fallback string) string {
 	return fallback
 }
 
-// cmdSetup scaffolds the home directory and an empty config.toml (idempotent unless
-// --force), then points at `channel add`. Channels are added individually so many of any
-// kind can coexist.
-func cmdSetup(args []string) error {
-	fs := flag.NewFlagSet("setup", flag.ContinueOnError)
-	cfgPath := fs.String("config", "", "config path (default $MESSENGER_HOME/config.toml)")
-	force := fs.Bool("force", false, "overwrite an existing config")
+// --- subscriptions --------------------------------------------------------------------------
+
+func cmdSubscribe(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: messenger subscribe <add|list|remove> ...")
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "list", "ls":
+		return subscribeList(rest)
+	case "add":
+		return subscribeAdd(rest)
+	case "remove", "rm":
+		return subscribeRemove(rest)
+	default:
+		return fmt.Errorf("unknown subscribe subcommand %q", sub)
+	}
+}
+
+func subscribeAdd(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: messenger subscribe add <name> --url URL [--channels a,b] [--secret-env NAME]")
+	}
+	name := args[0]
+	fs := flag.NewFlagSet("subscribe add", flag.ContinueOnError)
+	cfgPath := fs.String("config", "", "config path")
+	url := fs.String("url", "", "consumer URL each envelope is POSTed to")
+	channels := fs.String("channels", "", "comma-separated channel names to deliver (empty = all)")
+	secretEnv := fs.String("secret-env", "", "env var NAME holding the HMAC signing secret for pushes")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if *url == "" {
+		return fmt.Errorf("--url is required")
+	}
+	cfg, path, err := loadOrInitConfig(*cfgPath)
+	if err != nil {
+		return err
+	}
+	if cfg.Subscriptions == nil {
+		cfg.Subscriptions = map[string]config.Subscription{}
+	}
+	if _, exists := cfg.Subscriptions[name]; exists {
+		return fmt.Errorf("subscription %q already exists (remove it first)", name)
+	}
+	var chans []string
+	if *channels != "" {
+		for _, c := range strings.Split(*channels, ",") {
+			if c = strings.TrimSpace(c); c != "" {
+				chans = append(chans, c)
+			}
+		}
+	}
+	cfg.Subscriptions[name] = config.Subscription{Enabled: true, URL: *url, Channels: chans, SecretEnv: *secretEnv}
+	if err := saveConfig(path, cfg); err != nil {
+		return err
+	}
+	fmt.Printf("added subscription %q → %s (channels: %s)\n", name, *url, orAll(chans))
+	fmt.Println("  delivery is durable: its cursor advances only on 2xx; a down consumer catches up.")
+	if *secretEnv != "" {
+		fmt.Printf("  pushes are HMAC-signed with $%s (X-Messenger-Signature-256; value never printed)\n", *secretEnv)
+	}
+	return nil
+}
+
+func subscribeList(args []string) error {
+	fs := flag.NewFlagSet("subscribe list", flag.ContinueOnError)
+	cfgPath := fs.String("config", "", "config path")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := loadConfig(*cfgPath)
+	if err != nil {
+		return err
+	}
+	if len(cfg.Subscriptions) == 0 {
+		fmt.Println("no subscriptions. add one: messenger subscribe add <name> --url URL")
+		return nil
+	}
+	names := sortedKeys(cfg.Subscriptions)
+	fmt.Printf("%-16s %-8s %-8s %-30s %s\n", "NAME", "ENABLED", "CURSOR", "URL", "CHANNELS")
+	for _, n := range names {
+		s := cfg.Subscriptions[n]
+		fmt.Printf("%-16s %-8v %-8d %-30s %s\n", n, s.Enabled, readCursorFile(home.Path("cursors", n)), s.URL, orAll(s.Channels))
+	}
+	return nil
+}
+
+func subscribeRemove(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: messenger subscribe remove <name>")
+	}
+	name := args[0]
+	fs := flag.NewFlagSet("subscribe remove", flag.ContinueOnError)
+	cfgPath := fs.String("config", "", "config path")
+	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 	path := *cfgPath
 	if path == "" {
 		path = home.ConfigPath()
 	}
-	if err := os.MkdirAll(home.Dir(), 0o700); err != nil {
+	cfg, err := config.Load(path)
+	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(path); err == nil && !*force {
-		fmt.Printf("config already exists at %s (use --force to reset)\n", path)
-	} else {
-		empty := &config.Config{ServeTokenEnv: "MESSENGER_SERVE_TOKEN", Transports: map[string]config.Transport{}}
-		if err := config.Save(path, empty); err != nil {
-			return err
-		}
-		fmt.Printf("scaffolded home + empty config at %s\n", path)
+	if _, ok := cfg.Subscriptions[name]; !ok {
+		return fmt.Errorf("no subscription named %q", name)
 	}
-	fmt.Print(`
-add channels (many of any kind can coexist):
-  messenger channel add whatsapp home
-  messenger channel add telegram mybot --token-env TELEGRAM_BOT_TOKEN --chat-id -1001234567890
-  messenger channel add hook incoming --token-env MESSENGER_HOOK_SECRET
-then:
-  messenger channel list
-  messenger channel connect <name>     # whatsapp QR pair / telegram setWebhook
-  messenger serve                      # channel webhooks + POST /send, GET /inbox, /health
-secrets are referenced by NAME only — export the values, never printed here.
-`)
+	delete(cfg.Subscriptions, name)
+	if err := config.Save(path, cfg); err != nil {
+		return err
+	}
+	fmt.Printf("removed subscription %q (cursor file left at %s)\n", name, home.Path("cursors", name))
 	return nil
 }
 
-func loadConfig(path string) (*config.Config, error) {
-	if path == "" {
-		path = home.ConfigPath()
+func orAll(chans []string) string {
+	if len(chans) == 0 {
+		return "(all)"
 	}
-	return config.Load(path)
+	return strings.Join(chans, ",")
 }
 
-// cmdListen runs the enabled transports, appending inbound to the inbox and (optionally)
-// POSTing each envelope to a subscriber webhook. Pushed channels are served on --addr.
+// --- listen / send / serve -------------------------------------------------------------------
+
+// cmdListen runs ingress + the subscription dispatcher without the consumer API: inbound
+// is appended to the inbox and pushed to every subscription (and optionally an ad-hoc
+// --webhook URL). Pushed channels are served on --addr.
 func cmdListen(args []string) error {
 	fs := flag.NewFlagSet("listen", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "config path (default $MESSENGER_HOME/config.toml)")
 	addr := fs.String("addr", ":14310", "address for pushed channel webhooks")
-	webhook := fs.String("webhook", "", "optional subscriber URL to POST each inbound envelope to")
+	webhook := fs.String("webhook", "", "ad-hoc subscriber URL to POST each inbound envelope to (no cursor)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -393,35 +693,37 @@ func cmdListen(args []string) error {
 	if err != nil {
 		return err
 	}
-	pub := fanout(box, *webhook)
-	lst := transport.NewListener(transport.DefaultRegistry(), cfg.Enabled(), pub)
+	disp := subscription.New(box, home.Path("cursors"), cfg.Subscriptions)
+	rt := channel.NewRuntime(cfg.Enabled(), channel.NewSecretResolver(nil), fanout(box, disp, *webhook))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := lst.Up(ctx); err != nil {
+	if err := rt.Up(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "messenger: listen (partial):", err)
 	}
-	srv := &http.Server{Addr: *addr, Handler: lst.HTTPHandler()}
-	go func() { <-ctx.Done(); _ = srv.Shutdown(context.Background()); lst.Down() }()
-	fmt.Printf("messenger listen on %s (channels: %v)\n", *addr, keys(cfg.Enabled()))
+	go disp.Run(ctx)
+	srv := &http.Server{Addr: *addr, Handler: rt.HTTPHandler()}
+	go func() { <-ctx.Done(); _ = srv.Shutdown(context.Background()); rt.Down() }()
+	fmt.Printf("messenger listen on %s (channels: %v, subscriptions: %d)\n", *addr, sortedKeys(cfg.Enabled()), disp.Count())
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil
 }
 
-// cmdSend delivers one message, threading a reply when --reply-to is set.
+// cmdSend delivers one message and prints the provider-assigned message id (the
+// caller's key to thread onto its own send).
 func cmdSend(args []string) error {
 	fs := flag.NewFlagSet("send", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "config path")
-	channel := fs.String("channel", "", "channel to send on (telegram|whatsapp|hook)")
+	ch := fs.String("channel", "", "channel NAME to send on")
 	text := fs.String("text", "", "message text")
-	to := fs.String("to", "", "thread/chat id to deliver to")
+	to := fs.String("to", "", "thread/chat/group id to deliver to (default: the channel's configured target)")
 	replyTo := fs.String("reply-to", "", "message id this send replies to (threads the reply)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *channel == "" || *text == "" {
+	if *ch == "" || *text == "" {
 		return fmt.Errorf("--channel and --text are required")
 	}
 	cfg, err := loadConfig(*cfgPath)
@@ -429,7 +731,7 @@ func cmdSend(args []string) error {
 		return err
 	}
 	env := envelope.Normalize(envelope.Envelope{
-		Channel:  *channel,
+		Channel:  *ch,
 		Text:     *text,
 		ThreadID: *to,
 		ReplyTo:  *replyTo,
@@ -437,14 +739,17 @@ func cmdSend(args []string) error {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := server.Deliver(ctx, cfg, transport.DefaultSenderRegistry(), transport.NewSecretResolver(nil), env); err != nil {
+	rt := channel.OpenSend(cfg, channel.NewSecretResolver(nil))
+	id, err := rt.Send(ctx, env)
+	if err != nil {
 		return err
 	}
-	fmt.Printf("sent id=%s channel=%s\n", env.ID, env.Channel)
+	fmt.Printf("sent id=%s channel=%s\n", id, env.Channel)
 	return nil
 }
 
-// cmdServe runs the channel webhooks + the consumer API on one port.
+// cmdServe runs everything on one port: channel webhooks, the consumer API, and the
+// subscription dispatcher.
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "config path")
@@ -460,37 +765,42 @@ func cmdServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	resolver := transport.NewSecretResolver(nil)
-	lst := transport.NewListener(transport.DefaultRegistry(), cfg.Enabled(), fanout(box, ""))
+	disp := subscription.New(box, home.Path("cursors"), cfg.Subscriptions)
+	rt := channel.NewRuntime(cfg.Enabled(), channel.NewSecretResolver(nil), fanout(box, disp, ""))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := lst.Up(ctx); err != nil {
+	if err := rt.Up(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "messenger: serve (partial):", err)
 	}
+	go disp.Run(ctx)
 
 	// Resolve the bearer token by NAME once, host-only; the value never enters a log.
 	token := ""
 	if cfg.ServeTokenEnv != "" {
 		token = os.Getenv(cfg.ServeTokenEnv)
 	}
-	srv := server.New(cfg, box, transport.DefaultSenderRegistry(), resolver, token, lst.HTTPHandler())
+	srv := server.New(rt, box, token)
 	hs := &http.Server{Addr: *addr, Handler: srv.Handler()}
-	go func() { <-ctx.Done(); _ = hs.Shutdown(context.Background()); lst.Down() }()
-	fmt.Printf("messenger serve on %s (channels: %v, auth: %v)\n", *addr, keys(cfg.Enabled()), token != "")
+	go func() { <-ctx.Done(); _ = hs.Shutdown(context.Background()); rt.Down() }()
+	fmt.Printf("messenger serve on %s (channels: %v, subscriptions: %d, auth: %v)\n",
+		*addr, sortedKeys(cfg.Enabled()), disp.Count(), token != "")
 	if err := hs.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil
 }
 
-// fanout builds the Publisher listen/serve inject: append to the inbox, then (if set)
-// POST the envelope to a subscriber webhook. A webhook failure is logged, never fatal.
-func fanout(box *inbox.Inbox, webhook string) transport.Publisher {
+// fanout builds the Publisher: append to the inbox, wake the subscription dispatcher,
+// and (if set) POST the envelope to an ad-hoc webhook. A push failure is logged, never fatal.
+func fanout(box *inbox.Inbox, disp *subscription.Dispatcher, webhook string) channel.Publisher {
 	client := &http.Client{Timeout: 10 * time.Second}
 	return func(env envelope.Envelope) {
 		if err := box.Append(env); err != nil {
 			fmt.Fprintln(os.Stderr, "messenger: inbox append:", err)
+		}
+		if disp != nil {
+			disp.Notify()
 		}
 		if webhook == "" {
 			return
@@ -510,10 +820,11 @@ func fanout(box *inbox.Inbox, webhook string) transport.Publisher {
 	}
 }
 
-func keys(m map[string]config.Transport) []string {
+func sortedKeys[V any](m map[string]V) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
 		out = append(out, k)
 	}
+	sort.Strings(out)
 	return out
 }
