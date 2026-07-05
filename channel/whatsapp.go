@@ -2,7 +2,10 @@ package channel
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,10 +23,11 @@ import (
 
 // WhatsApp is GLOBAL: the host has ONE paired device (wacli's linked WhatsApp-Web
 // session), and every configured whatsapp channel is a named GROUP on that device.
-// Exactly one `wacli --json sync --follow` stream runs no matter how many whatsapp
-// channels exist; inbound is routed to the channel whose options["group"] JID matches
-// the message's chat, falling back to the catch-all channel (one configured with no
-// group), else the first channel by name. Sends target the channel's group (or an
+// Exactly one `wacli sync --follow --webhook …` subprocess runs no matter how many
+// whatsapp channels exist; inbound is routed STRICTLY to the channel whose
+// options["group"] JID matches the message's chat — a chat with no bound channel is
+// dropped, never mixed into another conversation (no catch-all). Sends target the
+// channel's group (or an
 // explicit --to thread), threading via wacli --reply-to when ReplyTo is set.
 
 // maxAttachmentFetch caps how much of a remote attachment URL we pull to a temp file
@@ -83,8 +87,8 @@ func (whatsappKind) AddHints(name string, cfg config.Transport) []string {
 	}
 	if cfg.Options["group"] == "" {
 		hints = append(hints,
-			"no --group set: this channel is the catch-all. bind a group with:",
-			fmt.Sprintf("  messenger channel connect %s     # lists your FREE groups + their JIDs", name))
+			"no --group set: this channel is SEND-ONLY and receives NOTHING (no catch-all).",
+			fmt.Sprintf("  bind a group to receive: messenger channel connect %s   # lists your FREE groups + their JIDs", name))
 	}
 	return hints
 }
@@ -126,11 +130,11 @@ func (whatsappKind) Detail(name string, cfg config.Transport) string {
 	if g := cfg.Options["group"]; g != "" {
 		return "group=" + g
 	}
-	return "(catch-all: unmatched chats land here)"
+	return "(no group — send-only, receives nothing)"
 }
 
-// Lane: an agent's whatsapp lane is a channel bound to its group (or the catch-all
-// when no group is given).
+// Lane: an agent's whatsapp lane is a channel bound to its group. A groupless lane is
+// send-only (no catch-all) — still allowed for outbound-to-any-JID use.
 func (k whatsappKind) Lane(name string, p LaneParams, existing map[string]config.Transport) (config.Transport, []string, error) {
 	var opts map[string]string
 	if p.Group != "" {
@@ -142,7 +146,7 @@ func (k whatsappKind) Lane(name string, p LaneParams, existing map[string]config
 	}
 	hint := fmt.Sprintf("channel %q → whatsapp group %s", name, p.Group)
 	if p.Group == "" {
-		hint = fmt.Sprintf("channel %q → whatsapp catch-all (no --group)", name)
+		hint = fmt.Sprintf("channel %q → whatsapp send-only (no --group; receives nothing)", name)
 	}
 	return want, []string{hint}, nil
 }
@@ -352,23 +356,35 @@ func fetchToTemp(ctx context.Context, url string) (string, error) {
 	return f.Name(), nil
 }
 
-// whatsappStream is the ONE shared inbound stream for every whatsapp channel: it runs
-// wacli as a long-lived subprocess, reads its NDJSON message lines, routes each by chat
-// JID to the matching group channel, and publishes the normalized Envelope. Supervised
-// by the runtime (crash = backoff + restart).
+// whatsappStream is the ONE shared inbound stream for every whatsapp channel.
+//
+// wacli delivers inbound over an HTTP WEBHOOK, NOT stdout: `wacli sync --follow` only
+// holds the WhatsApp connection open; `--webhook <URL>` is the sole channel for live
+// messages (it POSTs each message's JSON there). So the stream both (a) runs the
+// long-lived `wacli sync --follow --webhook <hub>/_wacli/inbound --webhook-allow-private
+// --webhook-secret <s>` subprocess, supervised by the runtime, AND (b) mounts an HTTP
+// handler at that path that verifies the X-Wacli-Signature HMAC and publishes each
+// posted message. Routing is strict: a message is delivered ONLY to the channel bound
+// to its chat JID — there is NO catch-all, so an unbound group is dropped (never mixed
+// into another conversation). Our own outbound echoes (from_me) are dropped too.
 type whatsappStream struct {
 	bin  string
-	args []string
+	args []string // override (tests); empty = build the webhook argv in Run
 
-	byGroup  map[string]string // group jid -> channel name
-	catchAll string            // channel with no group (else first by name)
+	byGroup  map[string]string // group jid -> channel name (the ONLY inbound routes)
 	accounts map[string]string // channel name -> account label
 
-	// commandContext is the exec seam so tests inject a fake emitter.
+	callbackURL string // hub loopback URL wacli POSTs to (injected by the runtime)
+	secret      string // per-boot HMAC secret shared with wacli --webhook-secret
+
+	// commandContext is the exec seam so tests inject a fake subprocess.
 	commandContext func(ctx context.Context, name string, arg ...string) *exec.Cmd
 	// runCmd is the exec seam for one-shot wacli calls (media download).
 	runCmd runCmdFunc
 }
+
+// wacliInboundPath is where the runtime mounts the receiver and where wacli POSTs.
+const wacliInboundPath = "/_wacli/inbound"
 
 func openWhatsappStream(chans map[string]config.Transport, _ *SecretResolver) (Streamer, error) {
 	if len(chans) == 0 {
@@ -383,19 +399,18 @@ func openWhatsappStream(chans map[string]config.Transport, _ *SecretResolver) (S
 	s := &whatsappStream{
 		byGroup:        map[string]string{},
 		accounts:       map[string]string{},
+		secret:         newInboundSecret(),
 		commandContext: exec.CommandContext,
 		runCmd:         defaultRunCmd,
 	}
 	for _, n := range names {
 		cfg := chans[n]
+		// Only group-bound channels receive. A no-group channel is send-only (it never
+		// catches unmatched chats — one group, one channel).
 		if g := cfg.Options["group"]; g != "" {
 			s.byGroup[g] = n
-		} else if s.catchAll == "" {
-			s.catchAll = n
 		}
 		s.accounts[n] = cfg.Account
-		// bin/args overrides: first channel that sets them wins (they describe the ONE
-		// device, not a channel).
 		if s.bin == "" {
 			s.bin = cfg.Options["bin"]
 		}
@@ -403,27 +418,81 @@ func openWhatsappStream(chans map[string]config.Transport, _ *SecretResolver) (S
 			s.args = strings.Fields(cfg.Options["args"])
 		}
 	}
-	if s.catchAll == "" {
-		s.catchAll = names[0]
-	}
 	if s.bin == "" {
 		s.bin = "wacli"
-	}
-	if len(s.args) == 0 {
-		s.args = []string{"--json", "sync", "--follow"}
 	}
 	return s, nil
 }
 
-// waMessage is the slice of a wacli JSON message line we normalize. Media fields
-// arrive in either casing depending on the wacli surface — the sync --follow stream
-// emits compact lowercase keys while the local store (`messages list --json`) uses
-// PascalCase — so both spellings are parsed and the accessors pick whichever is set.
+// newInboundSecret is the HMAC secret for the wacli→hub webhook. It is pinnable via
+// MESSENGER_WA_INBOUND_SECRET (handy for debugging or a fixed multi-process setup);
+// otherwise a per-boot random one is minted. It is handed to the subprocess and used to
+// verify posts — never written to user config. "" (rand failure) = accept unsigned
+// loopback posts.
+func newInboundSecret() string {
+	if s := os.Getenv("MESSENGER_WA_INBOUND_SECRET"); s != "" {
+		return s
+	}
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// Path/Handler/UseCallback make the stream a WebhookInbound the runtime mounts.
+func (s *whatsappStream) Path() string         { return wacliInboundPath }
+func (s *whatsappStream) UseCallback(u string) { s.callbackURL = u }
+
+func (s *whatsappStream) Handler(pub Publisher) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
+		if err != nil {
+			http.Error(w, "bad body", http.StatusBadRequest)
+			return
+		}
+		// The hub is publicly exposed (telegram needs it), so this endpoint MUST be
+		// authenticated: wacli signs with the shared secret (sha256=<hex>).
+		if s.secret != "" && !VerifyHMAC([]byte(s.secret), body, r.Header.Get("X-Wacli-Signature")) {
+			http.Error(w, "signature verification failed", http.StatusUnauthorized)
+			return
+		}
+		s.ingest(r.Context(), body, pub)
+		w.WriteHeader(http.StatusOK)
+	})
+}
+
+// waMessage is the slice of a wacli message JSON we normalize. Fields arrive in either
+// casing depending on the wacli surface (compact lowercase over the webhook, PascalCase
+// from the local store), so both spellings are parsed and the accessors pick whichever
+// is set.
 type waMessage struct {
-	ID     string `json:"id"`
-	Chat   string `json:"chat"`
-	Sender string `json:"sender"`
+	// id: compact webhook (id/msg_id/message_id) or store (MsgID).
+	ID        string `json:"id"`
+	MsgID     string `json:"msg_id"`
+	MessageID string `json:"message_id"`
+	MsgIDPC   string `json:"MsgID"`
+	// chat: chat/chat_jid (compact) or ChatJID (store).
+	Chat    string `json:"chat"`
+	ChatJID string `json:"chat_jid"`
+	ChatPC  string `json:"ChatJID"`
+	// sender: sender/sender_jid (compact) or SenderJID/SenderName (store).
+	Sender     string `json:"sender"`
+	SenderJID  string `json:"sender_jid"`
+	SenderPC   string `json:"SenderJID"`
+	SenderName string `json:"SenderName"`
+	// text: text/body (compact) or Text (store).
 	Text   string `json:"text"`
+	Body   string `json:"body"`
+	TextPC string `json:"Text"`
+
+	FromMeLC bool `json:"from_me"`
+	FromMeCC bool `json:"fromMe"`
+	FromMePC bool `json:"FromMe"`
 
 	MediaTypeLC string `json:"media_type"`
 	MediaTypePC string `json:"MediaType"`
@@ -434,6 +503,16 @@ type waMessage struct {
 	MIMELC      string `json:"mime"`
 	MIMEPC      string `json:"MimeType"`
 }
+
+func (m waMessage) id() string {
+	return firstNonEmpty(firstNonEmpty(m.ID, m.MsgID), firstNonEmpty(m.MessageID, m.MsgIDPC))
+}
+func (m waMessage) chat() string { return firstNonEmpty(firstNonEmpty(m.Chat, m.ChatJID), m.ChatPC) }
+func (m waMessage) sender() string {
+	return firstNonEmpty(firstNonEmpty(m.Sender, m.SenderJID), firstNonEmpty(m.SenderPC, m.SenderName))
+}
+func (m waMessage) text() string { return firstNonEmpty(firstNonEmpty(m.Text, m.Body), m.TextPC) }
+func (m waMessage) fromMe() bool { return m.FromMeLC || m.FromMeCC || m.FromMePC }
 
 func firstNonEmpty(a, b string) string {
 	if a != "" {
@@ -467,16 +546,26 @@ func attachmentType(mediaType string) string {
 	}
 }
 
-// route returns the channel name a message in chat belongs to.
-func (s *whatsappStream) route(chat string) string {
-	if n, ok := s.byGroup[chat]; ok {
-		return n
-	}
-	return s.catchAll
-}
+// route returns the channel bound to chat, or "" when no channel owns it. There is NO
+// catch-all: an unrouted message is dropped, never delivered to another channel.
+func (s *whatsappStream) route(chat string) string { return s.byGroup[chat] }
 
-func (s *whatsappStream) Run(ctx context.Context, pub Publisher) error {
-	cmd := s.commandContext(ctx, s.bin, s.args...)
+// Run launches the long-lived `wacli sync --follow --webhook …` subprocess that holds
+// the connection and POSTs inbound to our handler. stdout carries only lifecycle noise
+// (messages arrive over the webhook), so it is drained, not parsed. The runtime
+// supervises this with backoff on exit.
+func (s *whatsappStream) Run(ctx context.Context, _ Publisher) error {
+	args := s.args
+	if len(args) == 0 {
+		if s.callbackURL == "" {
+			return fmt.Errorf("channel: whatsapp: no inbound webhook URL — the hub self URL is unknown (serve/listen must set it)")
+		}
+		args = []string{"--json", "sync", "--follow", "--webhook", s.callbackURL, "--webhook-allow-private"}
+		if s.secret != "" {
+			args = append(args, "--webhook-secret", s.secret)
+		}
+	}
+	cmd := s.commandContext(ctx, s.bin, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -484,11 +573,13 @@ func (s *whatsappStream) Run(ctx context.Context, pub Publisher) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("channel: whatsapp: start %q: %w", s.bin, err)
 	}
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
-		s.handleLine(ctx, scanner.Text(), pub)
-	}
+	// Drain stdout so the pipe never blocks the subprocess; inbound is on the webhook.
+	go func() {
+		sc := bufio.NewScanner(stdout)
+		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for sc.Scan() {
+		}
+	}()
 	waitErr := cmd.Wait()
 	if ctx.Err() != nil {
 		return nil // cancelled: clean stop
@@ -499,42 +590,80 @@ func (s *whatsappStream) Run(ctx context.Context, pub Publisher) error {
 	return nil
 }
 
-// handleLine parses ONE stream line and publishes it when it carries a message: any
-// text, or any media (with or without a caption). Media is downloaded to the local
-// media dir best-effort; a failed download still publishes the envelope with a
-// metadata-only attachment — an inbound message is never dropped over a fetch error.
-func (s *whatsappStream) handleLine(ctx context.Context, line string, pub Publisher) {
-	line = strings.TrimSpace(line)
-	if line == "" || line[0] != '{' {
-		return // skip non-JSON progress lines
+// ingest parses a wacli webhook body — a single message object, a `{message|data:{…}}`
+// wrapper, or a `{messages:[…]}` / bare `[…]` array — and publishes each routed message.
+func (s *whatsappStream) ingest(ctx context.Context, body []byte, pub Publisher) {
+	for _, raw := range messageItems(body) {
+		s.publishMessage(ctx, raw, pub)
 	}
+}
+
+// messageItems teases the individual message JSONs out of whatever envelope wacli used.
+func messageItems(body []byte) []json.RawMessage {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var arr []json.RawMessage
+		if json.Unmarshal(trimmed, &arr) == nil {
+			return arr
+		}
+	}
+	var wrap struct {
+		Messages []json.RawMessage `json:"messages"`
+		Message  json.RawMessage   `json:"message"`
+		Data     json.RawMessage   `json:"data"`
+	}
+	if json.Unmarshal(trimmed, &wrap) == nil {
+		switch {
+		case len(wrap.Messages) > 0:
+			return wrap.Messages
+		case len(wrap.Message) > 0:
+			return []json.RawMessage{wrap.Message}
+		case len(wrap.Data) > 0:
+			var arr []json.RawMessage
+			if json.Unmarshal(wrap.Data, &arr) == nil {
+				return arr
+			}
+			return []json.RawMessage{wrap.Data}
+		}
+	}
+	return []json.RawMessage{trimmed} // treat the whole body as one message
+}
+
+// publishMessage normalizes ONE message and publishes it when it carries content and is
+// bound to a channel. Our own echoes (from_me) and messages for unbound chats are
+// dropped. Media is downloaded best-effort; a failed download still publishes the
+// envelope with a metadata-only attachment — an inbound message is never lost to a fetch
+// error.
+func (s *whatsappStream) publishMessage(ctx context.Context, raw json.RawMessage, pub Publisher) {
 	var m waMessage
-	if err := json.Unmarshal([]byte(line), &m); err != nil {
+	if err := json.Unmarshal(raw, &m); err != nil {
 		return
 	}
-	if m.Text == "" && m.mediaType() == "" {
+	if m.fromMe() {
+		return // our own outbound echoed back — not inbound
+	}
+	if m.text() == "" && m.mediaType() == "" {
 		return
 	}
-	text := m.Text
+	name := s.route(m.chat())
+	if name == "" {
+		return // no channel bound to this chat — dropped (no catch-all)
+	}
+	text := m.text()
 	if text == "" {
 		text = m.caption()
 	}
-	name := s.route(m.Chat)
-	env := envelope.Inbound(name, m.Sender, text, "WhatsApp")
+	env := envelope.Inbound(name, m.sender(), text, "WhatsApp")
 	env.Account = s.accounts[name]
-	if m.ID != "" {
-		env.ID = m.ID // wacli's stable message id → reply/dedupe key
+	if m.id() != "" {
+		env.ID = m.id() // wacli's stable message id → reply/dedupe key
 	}
-	if m.Chat != "" {
-		env.ThreadID = m.Chat
+	if m.chat() != "" {
+		env.ThreadID = m.chat()
 	}
 	if mt := m.mediaType(); mt != "" {
-		att := envelope.Attachment{
-			Type: attachmentType(mt),
-			Name: m.filename(),
-			MIME: m.mime(),
-		}
-		if p := s.downloadMedia(ctx, m.Chat, m.ID); p != "" {
+		att := envelope.Attachment{Type: attachmentType(mt), Name: m.filename(), MIME: m.mime()}
+		if p := s.downloadMedia(ctx, m.chat(), m.id()); p != "" {
 			att.Path = p
 			if fi, err := os.Stat(p); err == nil {
 				att.Size = fi.Size()

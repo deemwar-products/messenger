@@ -22,6 +22,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -109,7 +110,7 @@ usage:
 kinds:
   telegram  many channels, each its OWN bot (own --token-env) + default --chat-id
   whatsapp  ONE global paired device; each channel = a GROUP (--group <jid>);
-            one channel with no --group is the catch-all for unmatched chats
+            strict routing — a chat with no bound channel is dropped (no catch-all)
   webhook   many channels, each its own HMAC-signed path (/webhook/<name>) + secret
 
 secrets are referenced by NAME only (--token-env / --token-vault) — never a value.
@@ -847,6 +848,7 @@ func cmdListen(args []string) error {
 	}
 	disp := subscription.New(box, home.Path("cursors"), cfg.Subscriptions)
 	rt := channel.NewRuntime(cfg.Enabled(), channel.NewSecretResolver(nil), fanout(box, disp, *webhook))
+	rt.SetSelfURL(selfURLFromAddr(*addr))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -1061,6 +1063,7 @@ func cmdServe(args []string) error {
 	}
 	disp := subscription.New(box, home.Path("cursors"), cfg.Subscriptions)
 	rt := channel.NewRuntime(cfg.Enabled(), channel.NewSecretResolver(nil), fanout(box, disp, ""))
+	rt.SetSelfURL(selfURLFromAddr(*addr))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -1083,6 +1086,17 @@ func cmdServe(args []string) error {
 		return err
 	}
 	return nil
+}
+
+// selfURLFromAddr turns a listen addr (":14310", "0.0.0.0:14310", "1.2.3.4:80") into the
+// hub's loopback base URL, so a WebhookInbound stream (wacli) POSTs inbound to the local
+// hub regardless of the bind host.
+func selfURLFromAddr(addr string) string {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil || port == "" {
+		port = "14310"
+	}
+	return "http://127.0.0.1:" + port
 }
 
 // fanout builds the Publisher: append to the inbox, wake the subscription dispatcher,

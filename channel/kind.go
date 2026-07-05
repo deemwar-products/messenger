@@ -3,6 +3,7 @@ package channel
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sort"
 	"sync"
 
@@ -45,10 +46,20 @@ type Kind interface {
 
 // Streaming is the capability of kinds whose inbound is ONE shared long-lived stream
 // serving every channel of the kind (whatsapp: the single wacli subprocess). The
-// runtime asserts it — the only capability check in the system, mirroring how Pushed
-// is asserted on channels.
+// runtime asserts it — mirroring how Pushed is asserted on channels.
 type Streaming interface {
 	OpenStream(chans map[string]config.Transport, res *SecretResolver) (Streamer, error)
+}
+
+// WebhookInbound is a Streamer whose inbound ALSO arrives over an HTTP webhook the
+// runtime mounts on the shared server (whatsapp: `wacli sync --webhook` POSTs live
+// messages to us — sync's stdout carries none). The runtime mounts Handler at Path and
+// injects the loopback URL the subprocess must POST to via UseCallback.
+type WebhookInbound interface {
+	Streamer
+	Path() string
+	Handler(pub Publisher) http.Handler
+	UseCallback(url string)
 }
 
 // Traits are the kind's declarative facts the CLI reads (not behavior).

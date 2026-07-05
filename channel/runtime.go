@@ -18,9 +18,10 @@ import (
 // subprocess for all group channels) supervised with exponential backoff, and routes
 // Send by channel name. Per-channel/stream failure is isolated.
 type Runtime struct {
-	res  *SecretResolver
-	pub  Publisher
-	seed map[string]config.Transport
+	res     *SecretResolver
+	pub     Publisher
+	seed    map[string]config.Transport
+	selfURL string // hub loopback base URL, injected into WebhookInbound streams (wacli)
 
 	mu       sync.Mutex
 	channels map[string]Channel
@@ -52,6 +53,11 @@ func NewRuntime(seed map[string]config.Transport, res *SecretResolver, pub Publi
 
 // HTTPHandler is the shared server for Pushed channels, composable into `serve`.
 func (rt *Runtime) HTTPHandler() http.Handler { return rt.mux }
+
+// SetSelfURL tells the runtime its own loopback base URL (e.g. http://127.0.0.1:14310)
+// so WebhookInbound streams (wacli) can point their subprocess back at the hub. Call
+// before Up.
+func (rt *Runtime) SetSelfURL(u string) { rt.selfURL = u }
 
 // Channels returns name -> kind for everything opened (health/introspection).
 func (rt *Runtime) Channels() map[string]string {
@@ -112,6 +118,12 @@ func (rt *Runtime) Up(ctx context.Context) error {
 		if err != nil {
 			errs = append(errs, fmt.Errorf("channel: %s stream: %w", kind, err))
 			continue
+		}
+		// A stream that receives over an HTTP webhook (wacli) mounts its receiver on the
+		// shared mux and is told the loopback URL to point its subprocess at.
+		if wi, ok := st.(WebhookInbound); ok {
+			rt.mux.Handle(wi.Path(), wi.Handler(rt.pub))
+			wi.UseCallback(rt.selfURL + wi.Path())
 		}
 		rt.wg.Add(1)
 		go rt.supervise(ctx, kind, st)

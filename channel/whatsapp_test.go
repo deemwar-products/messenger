@@ -2,13 +2,92 @@ package channel
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/deemwar-products/messenger/config"
 	"github.com/deemwar-products/messenger/envelope"
 )
+
+// The whatsapp inbound WEBHOOK is the real transport (wacli sync stdout carries no
+// messages): a signed POST to the receiver publishes a routed envelope; an unbound chat
+// is dropped; our own from_me echo is dropped; a bad signature is 401'd.
+func TestWhatsappStream_WebhookInboundRoutesDropsAndVerifies(t *testing.T) {
+	t.Setenv("MESSENGER_HOME", t.TempDir())
+	chans := map[string]config.Transport{
+		"ops": {Kind: "whatsapp", Options: map[string]string{"group": "111@g.us"}},
+	}
+	st, err := openWhatsappStream(chans, NewSecretResolver(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := st.(*whatsappStream)
+	if s.secret == "" {
+		t.Fatal("stream should mint an inbound secret")
+	}
+	var got []envelope.Envelope
+	h := s.Handler(func(e envelope.Envelope) { got = append(got, e) })
+
+	post := func(body, sig string) int {
+		req := httptest.NewRequest(http.MethodPost, s.Path(), strings.NewReader(body))
+		if sig != "" {
+			req.Header.Set("X-Wacli-Signature", sig)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	signed := func(body string) string { return SignHMAC([]byte(s.secret), []byte(body)) }
+
+	// bound group, correctly signed → published, routed to "ops", threaded on the chat.
+	b1 := `{"id":"WA1","chat":"111@g.us","sender":"muthu","text":"hello desk"}`
+	if code := post(b1, signed(b1)); code != http.StatusOK {
+		t.Fatalf("signed bound-group post: want 200, got %d", code)
+	}
+	if len(got) != 1 || got[0].Channel != "ops" || got[0].Text != "hello desk" ||
+		got[0].ThreadID != "111@g.us" || got[0].ID != "WA1" {
+		t.Fatalf("bad published envelope: %+v", got)
+	}
+
+	// unbound chat → dropped (no catch-all).
+	b2 := `{"id":"WA2","chat":"999@g.us","sender":"x","text":"stray"}`
+	post(b2, signed(b2))
+	// our own echo → dropped.
+	b3 := `{"id":"WA3","chat":"111@g.us","sender":"me","text":"my own send","from_me":true}`
+	post(b3, signed(b3))
+	if len(got) != 1 {
+		t.Fatalf("unbound + from_me must be dropped, got %d envelopes: %+v", len(got), got)
+	}
+
+	// bad signature → 401, nothing published.
+	if code := post(b1, "sha256=deadbeef"); code != http.StatusUnauthorized {
+		t.Fatalf("bad signature: want 401, got %d", code)
+	}
+	if len(got) != 1 {
+		t.Fatalf("401 must not publish, got %d", len(got))
+	}
+}
+
+// The webhook body may be a single object, a {messages:[…]} wrapper, or a bare array —
+// messageItems teases each message out.
+func TestWhatsappMessageItems_Shapes(t *testing.T) {
+	cases := map[string]int{
+		`{"id":"a","chat":"1","text":"x"}`:     1,
+		`{"messages":[{"id":"a"},{"id":"b"}]}`: 2,
+		`[{"id":"a"},{"id":"b"},{"id":"c"}]`:   3,
+		`{"message":{"id":"a","text":"x"}}`:    1,
+		`{"data":[{"id":"a"},{"id":"b"}]}`:     2,
+	}
+	for body, want := range cases {
+		if got := len(messageItems([]byte(body))); got != want {
+			t.Fatalf("messageItems(%s) = %d, want %d", body, got, want)
+		}
+	}
+}
 
 // fakeRunCmd records every wacli invocation and plays back canned outputs, so send and
 // download paths are tested without a wacli binary.
@@ -182,7 +261,7 @@ func TestWhatsappStream_MediaLinePublishesAttachment(t *testing.T) {
 
 	var got []envelope.Envelope
 	line := `{"id":"M1","chat":"111@g.us","sender":"muthu","text":"","media_type":"image","caption":"look at this","filename":"pic.jpg","mime":"image/jpeg"}`
-	s.handleLine(context.Background(), line, func(e envelope.Envelope) { got = append(got, e) })
+	s.ingest(context.Background(), []byte(line), func(e envelope.Envelope) { got = append(got, e) })
 
 	if len(got) != 1 {
 		t.Fatalf("want 1 published envelope, got %d", len(got))
@@ -223,7 +302,7 @@ func TestWhatsappStream_MediaLinePublishesAttachment(t *testing.T) {
 // Filename/MimeType) parse too, and ptt normalizes to "voice".
 func TestWhatsappStream_DownloadFailureStillPublishesMetadata(t *testing.T) {
 	t.Setenv("MESSENGER_HOME", t.TempDir())
-	chans := map[string]config.Transport{"home": {Kind: "whatsapp"}}
+	chans := map[string]config.Transport{"grp": {Kind: "whatsapp", Options: map[string]string{"group": "555@g.us"}}}
 	st, err := openWhatsappStream(chans, NewSecretResolver(nil))
 	if err != nil {
 		t.Fatal(err)
@@ -233,8 +312,8 @@ func TestWhatsappStream_DownloadFailureStillPublishesMetadata(t *testing.T) {
 	s.runCmd = fake.run
 
 	var got []envelope.Envelope
-	line := `{"id":"M2","chat":"someone@s.whatsapp.net","sender":"muthu","MediaType":"ptt","MediaCaption":"","Filename":"note.ogg","MimeType":"audio/ogg"}`
-	s.handleLine(context.Background(), line, func(e envelope.Envelope) { got = append(got, e) })
+	line := `{"id":"M2","chat":"555@g.us","sender":"muthu","MediaType":"ptt","MediaCaption":"","Filename":"note.ogg","MimeType":"audio/ogg"}`
+	s.ingest(context.Background(), []byte(line), func(e envelope.Envelope) { got = append(got, e) })
 
 	if len(got) != 1 {
 		t.Fatalf("download failure must still publish; got %d envelopes", len(got))
@@ -259,9 +338,9 @@ func TestWhatsappStream_EmptyLineNotPublished(t *testing.T) {
 	s := st.(*whatsappStream)
 	published := 0
 	pub := func(envelope.Envelope) { published++ }
-	s.handleLine(context.Background(), `{"id":"M3","chat":"111@g.us","sender":"x"}`, pub)
-	s.handleLine(context.Background(), `not json`, pub)
-	s.handleLine(context.Background(), ``, pub)
+	s.ingest(context.Background(), []byte(`{"id":"M3","chat":"111@g.us","sender":"x"}`), pub)
+	s.ingest(context.Background(), []byte(`not json`), pub)
+	s.ingest(context.Background(), []byte(``), pub)
 	if published != 0 {
 		t.Fatalf("want 0 published, got %d", published)
 	}

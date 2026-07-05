@@ -82,13 +82,14 @@ func TestTelegramSend_ThreadsReplyAndReturnsID(t *testing.T) {
 	}
 }
 
-// whatsapp: ONE shared stream serves many group channels — inbound is routed to the
-// channel whose group JID matches the chat, and unmatched chats land on the catch-all.
+// whatsapp: ONE shared stream serves many group channels — inbound is routed STRICTLY
+// to the channel whose group JID matches the chat; an unbound chat is dropped (route
+// returns "") — there is no catch-all, and a no-group channel receives nothing.
 func TestWhatsappStream_RoutesGroupsToChannels(t *testing.T) {
 	chans := map[string]config.Transport{
 		"ops":  {Kind: "whatsapp", Options: map[string]string{"group": "111@g.us"}},
 		"fam":  {Kind: "whatsapp", Options: map[string]string{"group": "222@g.us"}},
-		"home": {Kind: "whatsapp"}, // no group = catch-all
+		"home": {Kind: "whatsapp"}, // no group = send-only, receives nothing
 	}
 	st, err := openWhatsappStream(chans, NewSecretResolver(nil))
 	if err != nil {
@@ -101,8 +102,8 @@ func TestWhatsappStream_RoutesGroupsToChannels(t *testing.T) {
 	if got := s.route("222@g.us"); got != "fam" {
 		t.Fatalf("222 should route to fam, got %q", got)
 	}
-	if got := s.route("someone@s.whatsapp.net"); got != "home" {
-		t.Fatalf("unmatched should route to catch-all home, got %q", got)
+	if got := s.route("someone@s.whatsapp.net"); got != "" {
+		t.Fatalf("unmatched chat must be dropped (no catch-all), got %q", got)
 	}
 }
 
@@ -141,5 +142,13 @@ func TestRuntime_SingleWhatsappStreamAndSendRouting(t *testing.T) {
 	// Unknown channel errors.
 	if _, err := rt.Send(ctx, envelope.Envelope{Channel: "nope", Text: "x"}); err == nil {
 		t.Fatal("want error for unknown channel")
+	}
+	// The whatsapp stream mounted its inbound webhook receiver on the shared mux: a POST
+	// to /_wacli/inbound is handled (401 without a signature, not 404).
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, wacliInboundPath, strings.NewReader(`{"chat":"111@g.us","text":"hi"}`))
+	rt.HTTPHandler().ServeHTTP(rec, req)
+	if rec.Code == http.StatusNotFound {
+		t.Fatal("wacli inbound receiver was not mounted on the shared mux")
 	}
 }
