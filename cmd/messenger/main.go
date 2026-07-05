@@ -25,8 +25,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -38,6 +40,7 @@ import (
 	"github.com/deemwar-products/messenger/home"
 	"github.com/deemwar-products/messenger/inbox"
 	"github.com/deemwar-products/messenger/server"
+	"github.com/deemwar-products/messenger/service"
 	"github.com/deemwar-products/messenger/skills"
 	"github.com/deemwar-products/messenger/subscription"
 )
@@ -67,6 +70,8 @@ func main() {
 		err = cmdServe(os.Args[2:])
 	case "install":
 		err = cmdInstall(os.Args[2:])
+	case "uninstall":
+		err = cmdUninstall(os.Args[2:])
 	case "register":
 		err = cmdRegister(os.Args[2:])
 	case "-h", "--help", "help":
@@ -94,7 +99,8 @@ usage:
   messenger channel add webhook  <name> --token-env NAME
   messenger channel list | remove <name> | connect <name> [--public-url URL]
   messenger channel test [<name>]          probe connectivity (whatsapp device, telegram getMe, webhook secret)
-  messenger install --skills               install the embedded agent skill into ~/.claude/skills
+  messenger install --skills | --wacli | --service    install: agent skill / wacli prereq / hub as an OS service
+  messenger uninstall --wacli | --service             uninstall the above
   messenger register <agent> [--group <jid> | --kind telegram|webhook --token-env NAME [--chat-id ID]]
                              [--channels a,b] [--url URL] [--secret-env NAME]
                                            one-shot agent onboarding: lane (any kind) + listen (idempotent)
@@ -530,19 +536,32 @@ func channelTest(args []string) error {
 	return nil
 }
 
-// cmdInstall installs binary-embedded assets. --skills drops the agent skill into the
-// agent skill directories so ANY installed messenger can enable agents to drive it.
+// cmdInstall installs one of: the embedded agent skill (--skills), the wacli WhatsApp
+// prerequisite (--wacli), or the hub as an OS service (--service).
 func cmdInstall(args []string) error {
 	fs := flag.NewFlagSet("install", flag.ContinueOnError)
 	skillsFlag := fs.Bool("skills", false, "install the embedded agent skill")
+	wacliFlag := fs.Bool("wacli", false, "install the wacli WhatsApp prerequisite (brew on macOS)")
+	serviceFlag := fs.Bool("service", false, "install the hub as an OS service (launchd/systemd), start on boot")
 	dir := fs.String("dir", "", "override the skill directory (default ~/.claude/skills)")
+	addr := fs.String("addr", ":14310", "service: address the hub serves on")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if !*skillsFlag {
-		return fmt.Errorf("nothing to install — did you mean: messenger install --skills")
+	switch {
+	case *skillsFlag:
+		return installSkills(*dir)
+	case *wacliFlag:
+		return installWacli()
+	case *serviceFlag:
+		return installService(*addr)
+	default:
+		return fmt.Errorf("nothing to install — one of: --skills | --wacli | --service")
 	}
-	target := *dir
+}
+
+func installSkills(dir string) error {
+	target := dir
 	if target == "" {
 		homeDir, err := os.UserHomeDir()
 		if err != nil {
@@ -556,6 +575,118 @@ func cmdInstall(args []string) error {
 	}
 	fmt.Printf("installed agent skill: %s\n", path)
 	fmt.Println("restart the agent session to pick it up.")
+	return nil
+}
+
+// installWacli ensures the wacli WhatsApp prerequisite is present. It runs the real
+// package command (brew on macOS) — never a buried curl|bash — and otherwise prints the
+// exact instruction. It never handles a secret. Then it reports the device pair state.
+func installWacli() error {
+	if p, err := exec.LookPath("wacli"); err == nil {
+		fmt.Printf("wacli already installed: %s\n", p)
+	} else {
+		switch runtime.GOOS {
+		case "darwin":
+			if _, err := exec.LookPath("brew"); err != nil {
+				return fmt.Errorf("Homebrew not found — install wacli manually: see https://wacli.sh")
+			}
+			fmt.Println("installing wacli via Homebrew (openclaw/tap/wacli)…")
+			cmd := exec.Command("brew", "install", "openclaw/tap/wacli")
+			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+			if err := cmd.Run(); err != nil {
+				return fmt.Errorf("brew install failed: %w", err)
+			}
+		default:
+			return fmt.Errorf("auto-install is macOS-only — install wacli manually:\n  see https://wacli.sh (repo github.com/openclaw/wacli)")
+		}
+	}
+	// Report device state + next step; pairing stays the explicit `channel connect` flow.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	st := channel.WhatsappDeviceStatus(ctx, "")
+	switch {
+	case st.Authenticated:
+		fmt.Printf("whatsapp device already linked (%s) — add group channels: messenger channel add whatsapp <name> --group <jid>\n", st.LinkedJID)
+	case st.Installed:
+		fmt.Println("wacli ready but not paired — pair once: messenger channel connect <a-whatsapp-channel>")
+	default:
+		fmt.Println("wacli still not on PATH — open a new shell, then: messenger channel connect <name>")
+	}
+	return nil
+}
+
+// installService installs the hub as an OS service (launchd/systemd), sourcing the
+// existing secret env file so no value lands in the unit. It refuses if a manually
+// started hub is already up (stop it first, so the service owns the single instance).
+func installService(addr string) error {
+	if probeRunning(addr) {
+		return fmt.Errorf("a hub is already running on %s — stop it first (so the service owns the one instance), then re-run", addr)
+	}
+	bin, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	envFile := home.Path("serve-token.env") // sourced at launch if present; only its PATH is in the unit
+	if _, statErr := os.Stat(envFile); statErr != nil {
+		envFile = ""
+	}
+	if err := service.Install(service.Config{Bin: bin, Addr: addr, Home: home.Dir(), EnvFile: envFile}); err != nil {
+		return err
+	}
+	fmt.Printf("installed messenger as a service (%s) — starts on boot, restarts on crash.\n", runtime.GOOS)
+	if envFile != "" {
+		fmt.Printf("  secrets sourced from %s at launch (never copied into the unit)\n", envFile)
+	}
+	fmt.Println("  manage it: messenger install --service (reinstall) · messenger uninstall --service")
+	return nil
+}
+
+// cmdUninstall reverses install: --wacli removes the prerequisite (and unlinks the
+// device), --service removes the OS service.
+func cmdUninstall(args []string) error {
+	fs := flag.NewFlagSet("uninstall", flag.ContinueOnError)
+	wacliFlag := fs.Bool("wacli", false, "uninstall wacli + unlink the WhatsApp device")
+	serviceFlag := fs.Bool("service", false, "remove the hub OS service")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	switch {
+	case *serviceFlag:
+		if err := service.Uninstall(); err != nil {
+			return err
+		}
+		fmt.Println("removed the messenger service.")
+		return nil
+	case *wacliFlag:
+		return uninstallWacli()
+	default:
+		return fmt.Errorf("nothing to uninstall — one of: --wacli | --service")
+	}
+}
+
+func uninstallWacli() error {
+	bin := "wacli"
+	if _, err := exec.LookPath(bin); err != nil {
+		fmt.Println("wacli is not installed — nothing to do.")
+		return nil
+	}
+	// Unlink the device first so no dangling linked device is left on the phone.
+	fmt.Println("unlinking the WhatsApp device (wacli logout)…")
+	lo := exec.Command(bin, "logout")
+	lo.Stdout, lo.Stderr = os.Stdout, os.Stderr
+	_ = lo.Run() // best-effort; proceed to removal regardless
+	if runtime.GOOS == "darwin" {
+		if _, err := exec.LookPath("brew"); err == nil {
+			fmt.Println("removing wacli via Homebrew…")
+			cmd := exec.Command("brew", "uninstall", "wacli")
+			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+			if err := cmd.Run(); err != nil {
+				return fmt.Errorf("brew uninstall failed: %w", err)
+			}
+			return nil
+		}
+	}
+	fmt.Println("device unlinked. Remove the wacli binary with your package manager (e.g. brew uninstall wacli).")
 	return nil
 }
 
