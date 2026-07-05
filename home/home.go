@@ -8,16 +8,20 @@ import (
 	"path/filepath"
 )
 
-// Dir returns the messenger home directory (MESSENGER_HOME or ~/.config/messenger).
+// Dir returns the messenger home directory: MESSENGER_HOME, else ~/.config/messenger on
+// EVERY platform. We deliberately do NOT use os.UserConfigDir() — on macOS that resolves
+// to ~/Library/Application Support, which would silently disagree with the documented and
+// deployed ~/.config/messenger (and, e.g., an OS service started without MESSENGER_HOME
+// would read a different, empty home than the CLI). One home path, all platforms.
 func Dir() string {
 	if h := os.Getenv("MESSENGER_HOME"); h != "" {
 		return h
 	}
-	cfg, err := os.UserConfigDir()
+	hd, err := os.UserHomeDir()
 	if err != nil {
-		cfg = filepath.Join(os.Getenv("HOME"), ".config")
+		hd = os.Getenv("HOME")
 	}
-	return filepath.Join(cfg, "messenger")
+	return filepath.Join(hd, ".config", "messenger")
 }
 
 // Path joins parts onto the home directory.

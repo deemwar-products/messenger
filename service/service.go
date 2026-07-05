@@ -22,6 +22,25 @@ type Config struct {
 	Addr    string // serve address, e.g. ":14310"
 	Home    string // $MESSENGER_HOME (not a secret)
 	EnvFile string // file sourced for secret env vars (e.g. serve-token.env); "" = none
+	Path    string // PATH to bake in — a launchd/systemd service has a minimal PATH that
+	// omits /opt/homebrew/bin etc., so the hub can't exec `wacli`; we snapshot the
+	// install-time PATH so the service finds the same tools the installing shell had.
+}
+
+// servicePath is the PATH the service runs with: the snapshotted install-time PATH,
+// with the common Homebrew + local bins ensured so `wacli` resolves even if the
+// installer's PATH was sparse. Falls back to a sane default when nothing was captured.
+func (c Config) servicePath() string {
+	base := c.Path
+	if base == "" {
+		base = "/usr/bin:/bin:/usr/sbin:/sbin"
+	}
+	for _, d := range []string{"/opt/homebrew/bin", "/usr/local/bin"} {
+		if !strings.Contains(base, d) {
+			base = d + ":" + base
+		}
+	}
+	return base
 }
 
 // launchCmd is the shell the service runs: source the (optional) secret env file, then
@@ -105,14 +124,17 @@ func installLaunchd(c Config) error {
     <string>%s</string>
   </array>
   <key>EnvironmentVariables</key>
-  <dict><key>MESSENGER_HOME</key><string>%s</string></dict>
+  <dict>
+    <key>MESSENGER_HOME</key><string>%s</string>
+    <key>PATH</key><string>%s</string>
+  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>%s</string>
   <key>StandardErrorPath</key><string>%s</string>
 </dict>
 </plist>
-`, label, xmlEscape(c.launchCmd()), c.Home, filepath.Join(c.Home, "serve.log"), filepath.Join(c.Home, "serve.log"))
+`, label, xmlEscape(c.launchCmd()), c.Home, xmlEscape(c.servicePath()), filepath.Join(c.Home, "serve.log"), filepath.Join(c.Home, "serve.log"))
 	if err := os.WriteFile(path, []byte(plist), 0o644); err != nil {
 		return err
 	}
@@ -150,13 +172,14 @@ After=network-online.target
 
 [Service]
 Environment=MESSENGER_HOME=%s
+Environment=PATH=%s
 ExecStart=/bin/sh -c '%s'
 Restart=always
 RestartSec=2
 
 [Install]
 WantedBy=default.target
-`, c.Home, c.launchCmd())
+`, c.Home, c.servicePath(), c.launchCmd())
 	if err := os.WriteFile(path, []byte(unit), 0o644); err != nil {
 		return err
 	}

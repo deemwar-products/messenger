@@ -630,7 +630,7 @@ func installService(addr string) error {
 	if _, statErr := os.Stat(envFile); statErr != nil {
 		envFile = ""
 	}
-	if err := service.Install(service.Config{Bin: bin, Addr: addr, Home: home.Dir(), EnvFile: envFile}); err != nil {
+	if err := service.Install(service.Config{Bin: bin, Addr: addr, Home: home.Dir(), EnvFile: envFile, Path: os.Getenv("PATH")}); err != nil {
 		return err
 	}
 	fmt.Printf("installed messenger as a service (%s) — starts on boot, restarts on crash.\n", runtime.GOOS)
