@@ -122,17 +122,26 @@ func VerifyHMAC(secret, body []byte, sig string) bool {
 }
 
 // normalizeWebhook turns a verified payload into the canonical inbound Envelope. It
-// reads a best-effort {text|message, sender|login, thread_id, reply_to, id} shape and
-// falls back to the raw body as text, so any signed caller can inject a message.
+// reads a best-effort {text|message, sender|login, thread_id, reply_to, id, attachments}
+// shape and falls back to the raw body as text, so any signed caller can inject a
+// message. Attachments pass through by reference (type/name/mime/url/size); a remote
+// caller's `path` is never trusted — Path names local files only, minted by messenger.
 func normalizeWebhook(name, account string, body []byte) envelope.Envelope {
 	var p struct {
-		Text     string `json:"text"`
-		Message  string `json:"message"`
-		Sender   string `json:"sender"`
-		Login    string `json:"login"`
-		ThreadID string `json:"thread_id"`
-		ReplyTo  string `json:"reply_to"`
-		ID       string `json:"id"`
+		Text        string `json:"text"`
+		Message     string `json:"message"`
+		Sender      string `json:"sender"`
+		Login       string `json:"login"`
+		ThreadID    string `json:"thread_id"`
+		ReplyTo     string `json:"reply_to"`
+		ID          string `json:"id"`
+		Attachments []struct {
+			Type string `json:"type"`
+			Name string `json:"name"`
+			MIME string `json:"mime"`
+			URL  string `json:"url"`
+			Size int64  `json:"size"`
+		} `json:"attachments"`
 	}
 	_ = json.Unmarshal(body, &p)
 	text := p.Text
@@ -152,6 +161,15 @@ func normalizeWebhook(name, account string, body []byte) envelope.Envelope {
 	env.ReplyTo = p.ReplyTo
 	if p.ID != "" {
 		env.ID = p.ID
+	}
+	for _, a := range p.Attachments {
+		env.Attachments = append(env.Attachments, envelope.Attachment{
+			Type: a.Type,
+			Name: a.Name,
+			MIME: a.MIME,
+			URL:  a.URL,
+			Size: a.Size,
+		})
 	}
 	return env
 }

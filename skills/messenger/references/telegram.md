@@ -44,10 +44,22 @@ Failure modes: "env TELEGRAM_BOT_TOKEN is unset" → export it where the hub run
 messenger send --channel mybot --text "hi"               # → the configured --chat-id
 messenger send --channel mybot --text "hi" --to 987654   # another chat (bot must be a member)
 messenger send --channel mybot --text "yes" --reply-to last   # threads via reply_to_message_id
+messenger send --channel mybot --file chart.png --text "caption"   # media (--text optional)
 ```
 
 `/send` returns the telegram `message_id` of YOUR message — usable as a future
-`reply_to`.
+`reply_to` (media sends included).
+
+## Attachments
+
+- **Inbound** photo/document/video/voice/audio is downloaded via `getFile` →
+  `/file/bot$TELEGRAM_BOT_TOKEN/<file_path>` (token by NAME, never a value) into
+  `$MESSENGER_HOME/media`; the telegram caption becomes the envelope `text`.
+- **Outbound** picks the Bot API method by attachment type — sendPhoto / sendVideo /
+  sendVoice / sendAudio / sendDocument (`document` and `file` both send as document);
+  `text` rides as the caption.
+- A `url` attachment is passed to Telegram as a plain URL string — Telegram fetches
+  it itself, no local download.
 
 ## Gotchas
 

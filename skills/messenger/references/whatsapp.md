@@ -12,7 +12,7 @@ Read this when adding/connecting/debugging a whatsapp channel.
 - A channel with **no `--group`** is the **catch-all**: DMs and unconfigured groups
   land there (with the real chat JID in `thread_id`, so you can still reply).
 - `thread_id` is the group JID; `sender` is the member who wrote; `id` is wacli's
-  stable message id (works with `--reply-to` → wacli `--quote`).
+  stable message id (feed it to `--reply-to` → wacli `send … --reply-to`).
 
 ## Pairing (once per host — NEVER re-pair a linked device)
 
@@ -42,12 +42,24 @@ store counts. `wacli groups list` / `wacli chats list` for JIDs.
 messenger send --channel ops --text "hi"                    # → the channel's group
 messenger send --channel ops --text "hi" --to <other-jid>   # any chat on the device
 messenger send --channel ops --text "on it" --reply-to last # quote the newest inbound
+messenger send --channel ops --file report.pdf --text "caption"   # media (--text optional)
 ```
+
+## Attachments
+
+- **Inbound** media is auto-downloaded (`wacli media download --chat <jid> --id
+  <msgid>`) into `$MESSENGER_HOME/media`; the envelope carries `attachments[].path`.
+  A failed download never blocks publish — the attachment rides metadata-only.
+- **Outbound** `--file` maps to `wacli send file --to <jid> --file <path> --caption
+  <text> [--reply-to <id>]`. A `url` attachment is downloaded first, then uploaded
+  (WhatsApp can't fetch URLs itself).
 
 ## Gotchas
 
 - Two whatsapp channels with the same `--group` = second one never receives (first
   match wins on routing).
+- Threaded replies use wacli's `--reply-to` flag; older docs said `--quote` — that
+  flag never existed in wacli.
 - wacli holds a store lock: don't run long `wacli sync` manually while the hub is up.
 - The stream is supervised with backoff; if wacli crashes it restarts automatically
   (`messenger serve` logs "whatsapp stream exited … restarting").

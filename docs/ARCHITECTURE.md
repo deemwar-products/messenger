@@ -28,7 +28,7 @@ code-level companion to `SPEC.md` (the product model) and `API.md` (the HTTP sur
 
 | package | responsibility | key types |
 |---|---|---|
-| `envelope` | the ONE wire value + normalize/reply helpers | `Envelope`, `Normalize`, `Inbound`, `Reply` |
+| `envelope` | the ONE wire value + normalize/reply helpers | `Envelope`, `Attachment`, `Normalize`, `Inbound`, `Reply` |
 | `home` | resolve `$MESSENGER_HOME` (default `~/.config/messenger`) | `Dir`, `ConfigPath`, `InboxPath` |
 | `config` | TOML at rest: channels + subscriptions + secret NAMES | `Config`, `Transport`, `Subscription` |
 | `inbox` | append-only NDJSON store, offset reads, newest-lookup | `Inbox.Append/Since/Last` |
@@ -87,7 +87,10 @@ under its own (`/health`, `/send`, `/inbox` shadow it).
 
 **Inbound:** platform edge (HTTP handler or stream line) → normalize to Envelope
 (stable `id` = platform message id when available; `thread_id` = chat/group; `channel` =
-configured NAME) → `Publisher` → fan-out: inbox.Append + Dispatcher.Notify.
+configured NAME) → `Publisher` → fan-out: inbox.Append + Dispatcher.Notify. Media is
+downloaded at the edge too — into `$MESSENGER_HOME/media`, referenced as
+`attachments[].path` (served at `GET /media/<basename>`); a failed download never
+blocks publish (the attachment rides metadata-only).
 
 **Delivery (subscriptions):** one goroutine per enabled subscription. Loop: read cursor
 file → `inbox.Since(cursor)` → filter by channel names (a filtered-out message still
@@ -98,7 +101,10 @@ At-least-once; consumers dedupe by envelope `id`. Wakes on notify + a 5s tick.
 **Outbound:** `/send` or CLI `send` → resolve `reply_to:"last"` via `inbox.Last(channel,
 thread)` (inherits the thread) → `Runtime.Send` → kind's `Send` → provider message id
 returned to the caller (telegram `result.message_id`, wacli send id, else the minted
-envelope id).
+envelope id). Each kind maps an attachment to its platform's upload (telegram
+sendPhoto/…/sendDocument by type, whatsapp `wacli send file`, webhook passes the
+envelope through); `text` rides as the caption, and a `url` attachment is fetched by
+the platform itself.
 
 ## Design decisions (and why)
 
@@ -126,6 +132,7 @@ envelope id).
 ```
 config.toml        channels + subscriptions + serveTokenEnv (0600; NAMES only)
 inbox.ndjson       every inbound envelope, append-only (the queue + audit log)
+media/             inbound media store — attachment `path` targets, served at GET /media/<file>
 cursors/<name>     one integer per subscription (1-based line offset)
 vault/<name>.age   optional age-encrypted secrets; keys/vault.key = host identity
 ```

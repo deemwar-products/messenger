@@ -93,7 +93,8 @@ usage:
   messenger subscribe add <name> --url URL [--channels a,b] [--secret-env NAME]
   messenger subscribe list | remove <name>
   messenger listen [--addr :14310] [--webhook URL]
-  messenger send   --channel <name> --text "hi" [--to THREAD] [--reply-to MSGID]
+  messenger send   --channel <name> [--text "hi"] [--file PATH|URL] [--to THREAD] [--reply-to MSGID]
+                                           (--text and/or --file; --file attaches a local path or http(s) URL)
   messenger serve  [--addr :14310]
 
 kinds:
@@ -847,19 +848,21 @@ func cmdListen(args []string) error {
 }
 
 // cmdSend delivers one message and prints the provider-assigned message id (the
-// caller's key to thread onto its own send).
+// caller's key to thread onto its own send). --file attaches one local path or http(s)
+// URL; with it set, --text is optional.
 func cmdSend(args []string) error {
 	fs := flag.NewFlagSet("send", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "config path")
 	ch := fs.String("channel", "", "channel NAME to send on")
-	text := fs.String("text", "", "message text")
+	text := fs.String("text", "", "message text (optional when --file is set)")
+	file := fs.String("file", "", "local path or http(s) URL to attach")
 	to := fs.String("to", "", "thread/chat/group id to deliver to (default: the channel's configured target)")
 	replyTo := fs.String("reply-to", "", "message id this send replies to, or \"last\" for the newest inbound on the channel/thread")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *ch == "" || *text == "" {
-		return fmt.Errorf("--channel and --text are required")
+	if *ch == "" || (*text == "" && *file == "") {
+		return fmt.Errorf("--channel plus --text or --file are required")
 	}
 	cfg, err := loadConfig(*cfgPath)
 	if err != nil {
@@ -884,12 +887,25 @@ func cmdSend(args []string) error {
 			*to = last.ThreadID
 		}
 	}
+	// The --file shorthand mirrors the /send `file` field: a remote http(s) reference
+	// rides as URL, anything else is a local Path; Name is the base, Type "file".
+	var attachments []envelope.Attachment
+	if *file != "" {
+		a := envelope.Attachment{Type: "file", Name: filepath.Base(*file)}
+		if strings.HasPrefix(*file, "http://") || strings.HasPrefix(*file, "https://") {
+			a.URL = *file
+		} else {
+			a.Path = *file
+		}
+		attachments = append(attachments, a)
+	}
 	env := envelope.Normalize(envelope.Envelope{
-		Channel:  *ch,
-		Text:     *text,
-		ThreadID: *to,
-		ReplyTo:  *replyTo,
-		Origin:   "messenger",
+		Channel:     *ch,
+		Text:        *text,
+		ThreadID:    *to,
+		ReplyTo:     *replyTo,
+		Origin:      "messenger",
+		Attachments: attachments,
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

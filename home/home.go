@@ -30,3 +30,6 @@ func ConfigPath() string { return Path("config.toml") }
 
 // InboxPath is the append-only inbound ndjson file.
 func InboxPath() string { return Path("inbox.ndjson") }
+
+// MediaDir is where inbound attachments are stored (served at GET /media/<basename>).
+func MediaDir() string { return Path("media") }

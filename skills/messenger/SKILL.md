@@ -21,8 +21,9 @@ normalized to an **Envelope**:
 ```
 
 `channel` = the configured channel NAME (not the kind). `id` + `thread_id` are all you
-need to reply. Default port **:14310**; state in `$MESSENGER_HOME` (default
-`~/.config/messenger`): `config.toml`, `inbox.ndjson`, `cursors/<consumer>`.
+need to reply; media rides as `attachments` (send: Recipe 2, fetch: Recipe 4). Default
+port **:14310**; state in `$MESSENGER_HOME` (default `~/.config/messenger`):
+`config.toml`, `inbox.ndjson`, `media/`, `cursors/<consumer>`.
 
 **Channel-kind specifics live in `references/` — read the one you're working with:**
 
@@ -64,12 +65,19 @@ messenger serve &                    # the hub
 ```sh
 messenger send --channel ops --text "build passed"            # to the channel's default target
 messenger send --channel ops --text "hi" --to <thread-id>     # explicit thread/chat/group
+messenger send --channel ops --file report.pdf --text "caption"   # attachment (--text optional)
 # or over HTTP against a running hub:
 curl -sS -X POST http://127.0.0.1:14310/send \
   -H "Authorization: Bearer $MESSENGER_SERVE_TOKEN" -H "Content-Type: application/json" \
   -d '{"channel":"ops","text":"build passed"}'
 # → {"ok":true,"id":"421"}   ← the PROVIDER message id; keep it to thread onto your own send
 ```
+
+`--file` / `"file"` takes a local path or an `http(s)` URL (the platform fetches URLs);
+`text` becomes the caption and is optional when a file is given — text OR file is
+required. Over HTTP, `{"channel":"ops","file":"/path/report.pdf"}` is the shorthand;
+full control is `"attachments":[{type,name,mime,path,url,size}]`. Per-kind behavior:
+`references/<kind>.md`.
 
 ## Recipe 3 — reply to a message (threaded)
 
@@ -97,6 +105,14 @@ Loop: pass the returned `next` back as `since` on the following call; equal `nex
 nothing new. Persist `next` if you need to survive restarts. To answer something you
 read, feed its `id`/`thread_id` straight into Recipe 3.
 
+Envelopes may carry `attachments` (media metadata + a local `path` on the hub). Fetch
+the bytes with the same bearer:
+
+```sh
+curl -sS "http://127.0.0.1:14310/media/<basename of attachments[].path>" \
+  -H "Authorization: Bearer $MESSENGER_SERVE_TOKEN" -o file
+```
+
 ## Recipe 5 — subscribe a consumer (durable push — prefer this over polling for services)
 
 ```sh
@@ -108,7 +124,8 @@ messenger subscribe list                                                    # sh
 Every envelope is POSTed to the URL in order. The consumer must answer 2xx; its cursor
 (`$MESSENGER_HOME/cursors/<name>`) advances only on success, so a down consumer catches
 up automatically (at-least-once — dedupe by envelope `id`). With `--secret-env`, verify
-`X-Messenger-Signature-256` = `sha256=<hex hmac of body>`.
+`X-Messenger-Signature-256` = `sha256=<hex hmac of body>`. Pushed envelopes include
+`attachments` too — fetch local-path media via `GET /media/<basename>` (Recipe 4).
 
 ## Recipe 6 — inject a message from a script
 

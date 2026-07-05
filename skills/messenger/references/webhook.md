@@ -31,16 +31,19 @@ curl -sS -X POST http://127.0.0.1:14310/webhook/incoming -H "X-Hub-Signature-256
 ```
 
 Accepted body fields (all optional, best-effort): `text` (or `message`), `sender` (or
-`login`), `thread_id`, `reply_to`, `id` (your own stable id; else one is minted).
+`login`), `thread_id`, `reply_to`, `id` (your own stable id; else one is minted),
+`attachments` (`[{type, name, mime, url, size}]` — remote references passed through;
+an inbound `path` is IGNORED, a caller must not name the hub's local files).
 A non-JSON body becomes the `text` verbatim. Header override:
 `--option signatureHeader=X-Custom-Sig`.
 
 ## Outbound (callback)
 
-`messenger send --channel bridge --text "hi" [--to T] [--reply-to ID]` POSTs the full
-Envelope JSON to `callbackURL` with `X-Hub-Signature-256` (when a secret is set). The
-receiver verifies the same way GitHub webhooks are verified. `reply_to`/`thread_id`
-are echoed — the receiver decides what threading means.
+`messenger send --channel bridge --text "hi" [--file F] [--to T] [--reply-to ID]` POSTs
+the full Envelope JSON — `attachments` included — to `callbackURL` with
+`X-Hub-Signature-256` (when a secret is set). The receiver verifies the same way GitHub
+webhooks are verified. `reply_to`/`thread_id` are echoed — the receiver decides what
+threading (and media fetching) means.
 
 ## Gotchas
 

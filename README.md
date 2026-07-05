@@ -33,6 +33,7 @@ messenger channel connect ops                # whatsapp: QR pair ONCE per host (
 messenger subscribe add factory --url http://localhost:9000/hook --channels mybot,ops
 messenger channel test                       # probe every channel (device, getMe, secrets)
 messenger serve                              # everything on :14310 (reuses a running hub)
+messenger send --channel ops --file report.pdf --text "caption"   # attachments in one flag
 messenger status                             # one-glance health
 messenger install --skills                   # drop the embedded agent skill into ~/.claude/skills
 ```
@@ -63,9 +64,11 @@ catches up. At-least-once, retried with backoff. Pushes are HMAC-signed
 
 ## HTTP API (`messenger serve`)
 
-- `POST /send` — `{channel, text, to?, reply_to?}` → `{ok, id}` where `id` is the
-  provider message id (bearer-auth when `serveTokenEnv` set)
+- `POST /send` — `{channel, text?, file?|attachments?, to?, reply_to?}` → `{ok, id}`
+  where `id` is the provider message id (bearer-auth when `serveTokenEnv` set)
 - `GET /inbox?since=N` — `{messages, next}`; `N` is a 1-based offset, pass `next` back
+- `GET /media/<file>` — inbound media bytes (what an envelope's `attachments[].path`
+  names), bearer-auth'd like `/inbox`
 - `GET /health` — `{ok, channels: {name: kind}}`
 
 ## Threaded replies
@@ -73,13 +76,21 @@ catches up. At-least-once, retried with backoff. Pushes are HMAC-signed
 Each inbound Envelope carries a stable `id` (telegram `message_id`, wacli id, or minted)
 and a `thread_id` (telegram chat id / whatsapp group JID). To answer *that* message pass
 its `id` as `reply_to` — telegram uses `reply_to_message_id`, whatsapp uses wacli
-`--quote`, webhook echoes it. `/send` returns the id of YOUR outbound message, so
+`--reply-to`, webhook echoes it. `/send` returns the id of YOUR outbound message, so
 consumers can thread onto their own sends too.
 
 **Conversation-first shortcut:** `reply_to: "last"` (API) or `--reply-to last` (CLI)
 answers the newest inbound message on the channel (scoped to `to`'s thread when given)
 and inherits its thread — "reply to the obvious previous message" with zero id
 bookkeeping: `messenger send --channel ops --text "on it" --reply-to last`.
+
+## Attachments
+
+Envelopes carry media. Inbound files are downloaded to `$MESSENGER_HOME/media` and ride
+as `attachments` (type/name/mime/path/url/size); consumers fetch the bytes via
+`GET /media/<basename>`. Outbound is one flag — `messenger send --channel ops --file
+report.pdf [--text "caption"]` (or `/send` with `file`/`attachments`); a URL is fetched
+by the platform.
 
 ## Secrets
 

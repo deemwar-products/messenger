@@ -1,17 +1,22 @@
 // Package server is messenger's small HTTP surface for `serve`: it mounts the runtime's
 // channel webhooks (telegram/webhook inbound arrive on the same port) and exposes the
-// consumer API — POST /send, GET /inbox?since=N, GET /health. POST /send is bearer-auth'd
-// when a token is configured; the inbound webhooks carry their own per-channel HMAC/secret.
+// consumer API — POST /send, GET /inbox?since=N, GET /media/<basename>, GET /health.
+// POST /send is bearer-auth'd when a token is configured; the inbound webhooks carry
+// their own per-channel HMAC/secret.
 package server
 
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"mime"
 	"net/http"
+	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/deemwar-products/messenger/channel"
 	"github.com/deemwar-products/messenger/envelope"
+	"github.com/deemwar-products/messenger/home"
 	"github.com/deemwar-products/messenger/inbox"
 )
 
@@ -34,6 +39,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/health", s.health)
 	mux.HandleFunc("/send", s.requireAuth(s.send))
 	mux.HandleFunc("/inbox", s.requireAuth(s.inbox))
+	mux.HandleFunc("/media/", s.requireAuth(s.media))
 	// Mount the channel webhooks (telegram/webhook) under the same server.
 	mux.Handle("/", s.rt.HTTPHandler())
 	return mux
@@ -45,13 +51,28 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "service": "messenger", "channels": s.rt.Channels()})
 }
 
-// sendReq is the POST /send body: channel + text, with optional to (thread/chat/group)
-// and reply_to (message id to thread the reply onto).
+// sendReq is the POST /send body: channel plus text and/or attachments, with optional
+// to (thread/chat/group) and reply_to (message id to thread the reply onto). `file` is
+// the one-attachment shorthand: a local path or http(s) URL that becomes attachments[0].
 type sendReq struct {
-	Channel string `json:"channel"`
-	Text    string `json:"text"`
-	To      string `json:"to"`
-	ReplyTo string `json:"reply_to"`
+	Channel     string                `json:"channel"`
+	Text        string                `json:"text"`
+	To          string                `json:"to"`
+	ReplyTo     string                `json:"reply_to"`
+	File        string                `json:"file"`
+	Attachments []envelope.Attachment `json:"attachments"`
+}
+
+// fileAttachment builds the shorthand attachment: a remote http(s) reference rides as
+// URL, anything else is a local Path. Name is the base name, Type the generic "file".
+func fileAttachment(file string) envelope.Attachment {
+	a := envelope.Attachment{Type: "file", Name: filepath.Base(file)}
+	if strings.HasPrefix(file, "http://") || strings.HasPrefix(file, "https://") {
+		a.URL = file
+	} else {
+		a.Path = file
+	}
+	return a
 }
 
 func (s *Server) send(w http.ResponseWriter, r *http.Request) {
@@ -64,8 +85,12 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad body", http.StatusBadRequest)
 		return
 	}
-	if req.Channel == "" || req.Text == "" {
-		http.Error(w, "channel and text are required", http.StatusBadRequest)
+	attachments := req.Attachments
+	if req.File != "" {
+		attachments = append(attachments, fileAttachment(req.File))
+	}
+	if req.Channel == "" || (req.Text == "" && len(attachments) == 0) {
+		http.Error(w, "channel and text (or an attachment) are required", http.StatusBadRequest)
 		return
 	}
 	// Conversation-first: reply_to "last" resolves to the newest inbound message on
@@ -88,11 +113,12 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	env := envelope.Normalize(envelope.Envelope{
-		Channel:  req.Channel,
-		Text:     req.Text,
-		ThreadID: to,
-		ReplyTo:  replyTo,
-		Origin:   "messenger",
+		Channel:     req.Channel,
+		Text:        req.Text,
+		ThreadID:    to,
+		ReplyTo:     replyTo,
+		Origin:      "messenger",
+		Attachments: attachments,
 	})
 	id, err := s.rt.Send(r.Context(), env)
 	if err != nil {
@@ -116,6 +142,41 @@ func (s *Server) inbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"messages": msgs, "next": next})
+}
+
+// media serves one stored attachment: GET /media/<basename> streams the file from the
+// home media dir. SECURITY: only the final path element is honored — anything empty,
+// dot-only, or still containing a separator after trimming the prefix is rejected, so a
+// traversal outside the media dir is impossible. Absent files are 404.
+func (s *Server) media(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	name := strings.TrimPrefix(r.URL.Path, "/media/")
+	if name == "" || name == "." || name == ".." ||
+		strings.ContainsAny(name, "/\\") || name != filepath.Base(name) {
+		http.Error(w, "bad media name", http.StatusBadRequest)
+		return
+	}
+	path := filepath.Join(home.MediaDir(), name)
+	ct := mime.TypeByExtension(filepath.Ext(name))
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	f, err := http.Dir(home.MediaDir()).Open(name)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.IsDir() {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", ct)
+	http.ServeContent(w, r, path, st.ModTime(), f)
 }
 
 // requireAuth enforces the bearer token on the consumer API when one is configured.

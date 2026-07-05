@@ -18,8 +18,9 @@ webhook hooks  ─┘
 ```
 
 - **Envelope** is the one wire value: `{id, channel, account, sender, text,
-  origin, thread_id, reply_to, ts, meta}`. `id` is stable (telegram message_id /
-  wacli id / minted); replies thread via `reply_to`.
+  origin, thread_id, reply_to, ts, meta, attachments}`. `id` is stable (telegram
+  message_id / wacli id / minted); replies thread via `reply_to`; media rides as
+  `attachments` (see below).
 - **Channels are ports**, keyed by NAME in config. Messenger owns transport +
   delivery guarantees; consumers own meaning (no routing rules in messenger).
 
@@ -77,6 +78,18 @@ the "answer the obvious previous message" case needs no id bookkeeping. Subscrip
 default to ALL channels (the `channels` filter is opt-in), so a consumer holds whole
 conversations across every port.
 
+## Attachments — store and reference
+
+Media is store-and-reference: `$MESSENGER_HOME/media` is the store, the envelope
+carries only metadata plus a `path` into it —
+`attachments: [{type, name, mime, path, url, size}]`, `type` ∈
+image|video|audio|voice|document|file. Inbound media is downloaded at the edge (per
+kind) into the media dir; `GET /media/<basename>` serves the bytes to remote
+consumers (bearer-auth'd like `/inbox`, path-traversal-safe). A failed download never
+blocks publish — the attachment rides metadata-only. Outbound: `--file PATH|URL`
+(CLI) or `{"file": …}` / a full `attachments` array (`/send`); `text` becomes the
+caption; a `url` attachment is fetched by the platform.
+
 ## Send returns the provider message id
 
 `POST /send` and `messenger send` return the id the platform assigned
@@ -96,7 +109,7 @@ messenger subscribe add <name> --url URL [--channels a,b] [--secret-env NAME]
 messenger subscribe list | remove <name>
 messenger listen [--addr :14310] [--webhook URL]   ingress + dispatcher, no consumer API
 messenger serve  [--addr :14310]                   everything on one port
-messenger send --channel <name> --text T [--to THREAD] [--reply-to ID]
+messenger send --channel <name> [--text T] [--file PATH|URL] [--to THREAD] [--reply-to ID]
 ```
 
 Wizard behavior: every verb prints the next step. `channel add whatsapp` checks

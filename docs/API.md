@@ -16,9 +16,21 @@ Everything a consumer needs to integrate over HTTP against a running hub
   "thread_id": "120363408634625681@g.us",   // where a reply lands (chat id / group JID)
   "reply_to": "",                           // id this message answers ("" = not a reply)
   "ts": 1783138037950,                      // unix millis
-  "meta": {}                                // optional producer annotations, never secrets
+  "meta": {},                               // optional producer annotations, never secrets
+  "attachments": [{                         // optional media riding the message
+    "type": "document",                     //   image | video | audio | voice | document | file
+    "name": "report.pdf",
+    "mime": "application/pdf",
+    "path": "…/media/report.pdf",           //   local file under $MESSENGER_HOME/media
+    "url": "",                              //   remote reference (webhook inbound / outbound fetch)
+    "size": 12345
+  }]
 }
 ```
+
+`attachments` is omitted when empty. Inbound media is downloaded into
+`$MESSENGER_HOME/media` and referenced by `path`; a remote consumer fetches the bytes
+via `GET /media/<basename of path>` (below).
 
 ## Auth
 
@@ -46,12 +58,19 @@ it to detect a running hub and REUSE it rather than start another.
 Request:
 
 ```json
-{"channel": "ops", "text": "on it", "to": "<thread, optional>", "reply_to": "<id | \"last\", optional>"}
+{"channel": "ops", "text": "on it", "to": "<thread, optional>", "reply_to": "<id | \"last\", optional>",
+ "file": "<local path or http(s) URL, optional>"}
 ```
 
+- `text` OR an attachment is required (`400` when both are missing). With an
+  attachment, `text` becomes the caption.
+- `file` is shorthand for ONE attachment: a local file path or an `http(s)` URL. For
+  full control send `"attachments": [{type, name, mime, path, url, size}]` instead.
+  A `url` attachment is fetched by the platform (telegram is handed the URL directly;
+  whatsapp downloads then uploads).
 - `to` omitted → the channel's configured default target (`--chat-id` / `--group`).
 - `reply_to: "<id>"` → threads onto that message (telegram `reply_to_message_id`,
-  whatsapp `--quote`, webhook echo).
+  wacli `--reply-to`, webhook echo).
 - `reply_to: "last"` → resolves to the NEWEST inbound envelope on the channel (scoped
   to `to`'s thread when given) and inherits its thread. `409` if the conversation is
   empty.
@@ -79,6 +98,18 @@ Poll surface (ad-hoc consumers; services should prefer subscriptions).
 as the following call's `since`; unchanged `next` = nothing new. Offsets index the
 append-only inbox file, so they are stable across restarts.
 
+## GET /media/\<file>
+
+Serves one file from `$MESSENGER_HOME/media` — the store every inbound attachment's
+`path` points into. Bearer-auth'd exactly like `/inbox`. `<file>` is a basename only
+(path traversal is rejected); `404` when absent. Typical flow: read an envelope, take
+`basename(attachment.path)`, GET it:
+
+```sh
+curl -sS http://127.0.0.1:14310/media/report.pdf \
+  -H "Authorization: Bearer $MESSENGER_SERVE_TOKEN" -o report.pdf
+```
+
 ## Inbound channel webhooks (same port)
 
 - `POST /telegram/<name>` — the Telegram Bot API webhook (register via
@@ -101,6 +132,8 @@ Registered via `messenger subscribe add <name> --url URL [--channels a,b] [--sec
   catch-up. **Dedupe by envelope `id`.**
 - With `--secret-env`, each push carries `X-Messenger-Signature-256: sha256=<hex>` —
   verify exactly like a GitHub webhook (HMAC-SHA256 over the raw body).
+- Pushed envelopes include `attachments`; the media bytes stay on the hub — fetch them
+  via `GET /media/<basename of path>` (bearer-auth'd).
 - To answer a pushed message: `POST /send {"channel": env.channel, "text": …,
   "reply_to": env.id}` (or `"last"`).
 

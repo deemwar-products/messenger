@@ -28,16 +28,29 @@ import (
 //	TS        unix millis the envelope was minted
 //	Meta      free-form producer annotations (never a secret value)
 type Envelope struct {
-	ID       string            `json:"id"`
-	Channel  string            `json:"channel"`
-	Account  string            `json:"account,omitempty"`
-	Sender   string            `json:"sender,omitempty"`
-	Text     string            `json:"text"`
-	Origin   string            `json:"origin,omitempty"`
-	ThreadID string            `json:"thread_id,omitempty"`
-	ReplyTo  string            `json:"reply_to,omitempty"`
-	TS       int64             `json:"ts,omitempty"`
-	Meta     map[string]string `json:"meta,omitempty"`
+	ID          string            `json:"id"`
+	Channel     string            `json:"channel"`
+	Account     string            `json:"account,omitempty"`
+	Sender      string            `json:"sender,omitempty"`
+	Text        string            `json:"text"`
+	Origin      string            `json:"origin,omitempty"`
+	ThreadID    string            `json:"thread_id,omitempty"`
+	ReplyTo     string            `json:"reply_to,omitempty"`
+	TS          int64             `json:"ts,omitempty"`
+	Meta        map[string]string `json:"meta,omitempty"`
+	Attachments []Attachment      `json:"attachments,omitempty"`
+}
+
+// Attachment is one media item riding an Envelope. Inbound media is stored under
+// $MESSENGER_HOME/media and referenced by Path (served at GET /media/<basename>);
+// outbound attachments name a local Path or a remote URL to deliver. Never a secret.
+type Attachment struct {
+	Type string `json:"type"`           // image | video | audio | voice | document | file
+	Name string `json:"name,omitempty"` // display filename
+	MIME string `json:"mime,omitempty"`
+	Path string `json:"path,omitempty"` // local file (under the media dir for inbound)
+	URL  string `json:"url,omitempty"`  // remote reference (webhook passthrough / outbound fetch)
+	Size int64  `json:"size,omitempty"`
 }
 
 // newID mints a random 128-bit hex id. It never encodes a secret.
