@@ -6,7 +6,9 @@ inbound messages to N consumers with durable per-consumer cursors — so any pro
 trading desk, an agent OS, a script) plugs in over plain HTTP. No broker. The CLI is the
 whole interface.
 
-**Docs:** [`docs/SPEC.md`](docs/SPEC.md) (product model) ·
+**Docs:** [`ONBOARDING.md`](ONBOARDING.md) (humans: zero→working) ·
+[`AGENTS.md`](AGENTS.md) (the contract for agents & boot scripts — one hub, register, never serve) ·
+[`docs/SPEC.md`](docs/SPEC.md) (product model) ·
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (packages, flows, design decisions) ·
 [`docs/API.md`](docs/API.md) (HTTP surface, exact shapes) ·
 [`skills/messenger/`](skills/messenger/) (agent skill + per-kind references)

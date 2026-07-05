@@ -113,7 +113,18 @@ curl -sS "http://127.0.0.1:14310/media/<basename of attachments[].path>" \
   -H "Authorization: Bearer $MESSENGER_SERVE_TOKEN" -o file
 ```
 
-## Recipe 5 — subscribe a consumer (durable push — prefer this over polling for services)
+## Recipe 5 — onboard an agent / subscribe a consumer (durable push — prefer over polling)
+
+One-shot agent onboarding (lane + listen, idempotent — safe to re-run from boot scripts):
+
+```sh
+messenger register cryptodesk --group 123456789@g.us --url http://127.0.0.1:9100/hook
+# creates whatsapp channel "cryptodesk" bound to the group (refuses a JID already bound
+# elsewhere), registers subscription "cryptodesk" filtered to it, prints the agent's
+# exact send/reply/listen contract. Omit --url → poll-mode instructions instead.
+```
+
+Plain subscriptions:
 
 ```sh
 messenger subscribe add factory --url http://localhost:9000/hook            # ALL channels

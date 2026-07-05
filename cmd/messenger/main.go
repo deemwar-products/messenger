@@ -67,6 +67,8 @@ func main() {
 		err = cmdServe(os.Args[2:])
 	case "install":
 		err = cmdInstall(os.Args[2:])
+	case "register":
+		err = cmdRegister(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -93,6 +95,8 @@ usage:
   messenger channel list | remove <name> | connect <name> [--public-url URL]
   messenger channel test [<name>]          probe connectivity (whatsapp device, telegram getMe, webhook secret)
   messenger install --skills               install the embedded agent skill into ~/.claude/skills
+  messenger register <agent> [--group <jid>] [--channels a,b] [--url URL] [--secret-env NAME]
+                                           one-shot agent onboarding: lane + listen (idempotent)
   messenger subscribe add <name> --url URL [--channels a,b] [--secret-env NAME]
   messenger subscribe list | remove <name>
   messenger listen [--addr :14310] [--webhook URL]
@@ -387,6 +391,15 @@ func channelAdd(args []string) error {
 	}
 	if _, exists := cfg.Transports[name]; exists {
 		return fmt.Errorf("channel %q already exists (remove it first)", name)
+	}
+	// One group JID = ONE channel: a duplicate bind silently shadows the first (first
+	// match wins in stream routing), so refuse it here.
+	if *group != "" {
+		for existing, t := range cfg.Transports {
+			if t.Options["group"] == *group {
+				return fmt.Errorf("group %s is already bound to channel %q — one JID = one channel", *group, existing)
+			}
+		}
 	}
 	if *chatID != "" {
 		opts["chatId"] = *chatID
@@ -686,6 +699,98 @@ func baseURLFor(addr string) string {
 func envNameOr(name, fallback string) string {
 	if name != "" {
 		return name
+	}
+	return fallback
+}
+
+// cmdRegister is one-shot agent onboarding: give an agent a lane (its own channel,
+// created when --group names a whatsapp group) and a listen (its own subscription when
+// --url is given; poll instructions otherwise), then print exactly how the agent sends,
+// replies, and receives. Idempotent: re-running updates the subscription and accepts an
+// existing identical channel, so boot scripts can run it every boot.
+func cmdRegister(args []string) error {
+	if len(args) < 1 || strings.HasPrefix(args[0], "-") {
+		return fmt.Errorf("usage: messenger register <agent> [--group <jid>] [--channels a,b] [--url URL] [--secret-env NAME]")
+	}
+	name := args[0]
+	fs := flag.NewFlagSet("register", flag.ContinueOnError)
+	cfgPath := fs.String("config", "", "config path")
+	group := fs.String("group", "", "whatsapp group JID — creates channel <agent> bound to it")
+	channels := fs.String("channels", "", "existing channel names the agent listens to (default: its own)")
+	url := fs.String("url", "", "agent's push endpoint (omit = agent polls /inbox)")
+	secretEnv := fs.String("secret-env", "", "env var NAME that HMAC-signs pushes to the agent")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	cfg, path, err := loadOrInitConfig(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	// Lane: --group creates (or accepts) the whatsapp channel named after the agent.
+	// One JID = ONE channel — a duplicate bind would silently shadow the first.
+	if *group != "" {
+		for existing, t := range cfg.Transports {
+			if existing != name && t.Options["group"] == *group {
+				return fmt.Errorf("group %s is already bound to channel %q — one JID = one channel (subscribe to it instead: --channels %s)", *group, existing, existing)
+			}
+		}
+		if t, exists := cfg.Transports[name]; exists {
+			if t.Options["group"] != *group {
+				return fmt.Errorf("channel %q already exists with a different target — remove it first", name)
+			}
+		} else {
+			cfg.Transports[name] = config.Transport{Enabled: true, Kind: "whatsapp", Options: map[string]string{"group": *group}}
+			fmt.Printf("channel %q → whatsapp group %s\n", name, *group)
+		}
+	}
+
+	// Listen: the agent's own subscription (updated in place — registration is idempotent).
+	var chans []string
+	if *channels != "" {
+		for _, c := range strings.Split(*channels, ",") {
+			if c = strings.TrimSpace(c); c != "" {
+				chans = append(chans, c)
+			}
+		}
+	} else if _, ok := cfg.Transports[name]; ok {
+		chans = []string{name} // default lane: its own channel
+	}
+	for _, c := range chans {
+		if _, ok := cfg.Transports[c]; !ok {
+			return fmt.Errorf("channel %q does not exist (add it first, or pass --group to create one)", c)
+		}
+	}
+	if *url != "" {
+		if cfg.Subscriptions == nil {
+			cfg.Subscriptions = map[string]config.Subscription{}
+		}
+		cfg.Subscriptions[name] = config.Subscription{Enabled: true, URL: *url, Channels: chans, SecretEnv: *secretEnv}
+		fmt.Printf("subscription %q → %s (channels: %s)\n", name, *url, orAll(chans))
+	}
+	if err := saveConfig(path, cfg); err != nil {
+		return err
+	}
+
+	// The agent's exact contract — print it so onboarding is copy-paste.
+	fmt.Printf(`
+agent %q is registered. Its contract (also in AGENTS.md):
+  discover (never serve):  curl -sf http://127.0.0.1:14310/health
+  send:   curl -sS -X POST http://127.0.0.1:14310/send -H "Authorization: Bearer $MESSENGER_SERVE_TOKEN" \
+            -d '{"channel":"%s","text":"hello"}'
+  reply:  same, plus "reply_to":"<envelope id>" (or "last")
+`, name, firstOr(chans, "<channel>"))
+	if *url != "" {
+		fmt.Printf("  listen: envelopes for %s are POSTed to %s in order — answer 2xx, dedupe by id;\n          restart the hub (or wait for its next boot) if it is already running so the subscription loads.\n", orAll(chans), *url)
+	} else {
+		fmt.Printf("  listen: poll GET /inbox?since=N (persist the returned next); no push endpoint registered.\n")
+	}
+	return nil
+}
+
+func firstOr(list []string, fallback string) string {
+	if len(list) > 0 {
+		return list[0]
 	}
 	return fallback
 }
