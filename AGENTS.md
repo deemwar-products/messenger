@@ -1,10 +1,13 @@
 # AGENTS.md
 
-The full operating contract for agents, desks, and boot scripts is
-**[`skills/messenger/references/agents.md`](skills/messenger/references/agents.md)** —
-the canonical copy, shipped to every agent that runs `messenger install --skills`. This
-root file is the summary + pointer so it stays discoverable (GitHub, coding agents
-working in the repo).
+Two docs, two audiences:
+- **Set up messenger on a host** (install, pair WhatsApp, run as a service, wire
+  consumers): **[`ONBOARDING.md`](ONBOARDING.md)**.
+- **How a consumer uses it** (CEO, crypto desk, any agent — send/reply/receive contract):
+  **[`skills/messenger/references/agents.md`](skills/messenger/references/agents.md)** —
+  the canonical copy, shipped to every agent via `messenger install --skills`.
+
+This root file is the summary + pointer so it stays discoverable (GitHub, coding agents in the repo).
 
 ## The one law
 

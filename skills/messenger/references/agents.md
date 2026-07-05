@@ -1,98 +1,108 @@
-# agents.md — the messenger operating contract (READ FIRST)
+# agents.md — how a consumer uses messenger (CEO, crypto desk, any agent)
 
-The operational law for ANY process that wants channel I/O on a host (CEO hub, crypto
-desk, fleet workers, cron jobs, boot.sh). Follow it and hubs never fight, inbound never
-drops, and every agent can send + listen independently. This ships with the skill — it
-IS the reference agents onboard from. Recipes: `../SKILL.md`. Kind depth:
-`whatsapp.md` / `telegram.md` / `webhook.md`.
+The operating contract for ANY process that wants channel I/O on a host. Follow it and
+hubs never fight, inbound never drops, every agent sends + listens independently. This
+ships with the skill — it IS the reference agents onboard from. Recipes: `../SKILL.md`.
+Kind depth: `whatsapp.md` / `telegram.md` / `webhook.md`. Host setup: `../../../ONBOARDING.md`.
 
 ## The one law
 
-**ONE messenger hub per host. Agents NEVER run their own.** The WhatsApp device is a
-host-global singleton — a second hub (any port, any `$MESSENGER_HOME`, any binary copy)
-starts a second `wacli sync` stream, steals the device, and silently drops inbound.
-Everything below exists to make that impossible.
+**ONE messenger hub per host. Agents NEVER run their own hub or wacli.** The WhatsApp
+device is a host-global singleton — a second `messenger serve` / `wacli sync` steals it
+and silently drops inbound. The host owner runs the hub (as a managed service); you talk
+to it over HTTP. That's the whole discipline.
 
-## What EVERY agent must do (desk, worker, cron — no exceptions)
-
-**Rule 0 — discover, never start:**
+## Rule 0 — discover, never start
 
 ```sh
-curl -sf --max-time 2 http://127.0.0.1:14310/health   # {"ok":true,"service":"messenger",...}
+curl -sf --max-time 2 http://127.0.0.1:14310/health    # {"ok":true,"service":"messenger","channels":{…}}
 ```
 
-Hub answers → use it over HTTP. Hub absent → tell the host owner / trigger boot.sh.
-An agent NEVER runs `messenger serve`, NEVER runs `wacli` directly (not even
-`wacli sync` — it competes for the device), NEVER installs its own binary copy.
+- Answers `"service":"messenger"` → use it over HTTP for everything below.
+- Doesn't answer → tell the host owner (they run `messenger install --service`). Do NOT
+  start your own hub, do NOT run `wacli`, do NOT install a second binary.
 
-**Send** (auth header only when the hub has `serveTokenEnv` set — reference by NAME):
+**Auth:** when the hub sets a serve token, add `-H "Authorization: Bearer
+$MESSENGER_SERVE_TOKEN"` to every `/send`, `/inbox`, `/media` call. Reference the env var
+by NAME; never echo its value.
+
+## Send
 
 ```sh
 curl -sS -X POST http://127.0.0.1:14310/send \
   -H "Authorization: Bearer $MESSENGER_SERVE_TOKEN" -H "Content-Type: application/json" \
-  -d '{"channel":"<your-channel>","text":"hello"}'          # → {"ok":true,"id":"…"}
+  -d '{"channel":"<your-channel>","text":"hello"}'      # → {"ok":true,"id":"<provider msg id>"}
 ```
 
-**Reply** — answer the message you were given (`"reply_to": env.id`) or the newest one
-(`"reply_to":"last"`); never send unthreaded chatter into a group you were answering.
+`to` is optional (defaults to the channel's target). Attachments: add `"file":"<local
+path or http(s) URL>"`.
 
-**Listen — your OWN subscription, one per agent, named after you** (the host owner
-registers it once with `messenger register <you> … --url http://127.0.0.1:<port>/hook`):
+## Reply (threaded)
 
-- You get every envelope for YOUR channels POSTed in order; answer 2xx fast, process async.
-- Down = automatic catch-up from your cursor. At-least-once → **dedupe by envelope `id`**.
-- NEVER read another agent's cursor file, never share a subscription name.
-- No HTTP endpoint? Poll `GET /inbox?since=N` with your own persisted `next` instead.
-
-**Attachments:** inbound envelopes carry `attachments[]`; fetch bytes via
-`GET /media/<basename of path>` (same bearer). Send files with `{"file":"<path|url>"}`.
-
-**Your channel is your lane:** send only on channels assigned to you. Different groups
-on one device is the DESIGNED case — routing by group JID keeps conversations separate;
-don't cross lanes.
-
-## What boot.sh / the host owner does — and ONLY the host owner
-
-One supervisor per host (boot.sh / launchd / systemd) owns the hub lifecycle AND all
-config changes (`channel add/remove`, `subscribe`, `register`). Agents request; the
-owner wires.
+Answer the message you were handed with its id, or the newest one on the channel:
 
 ```sh
-MESSENGER_BIN=/path/to/the/ONE/canonical/messenger   # repo-local bin, never a global copy
-HUB=http://127.0.0.1:14310
-
-# 1. kill imposters — any messenger serve/listen NOT running the canonical binary
-for pid in $(pgrep -f "messenger (serve|listen)"); do
-  [ "$(ps -o comm= -p "$pid")" = "$MESSENGER_BIN" ] || kill "$pid"
-done
-# 2. ensure THE hub (idempotent — serve self-guards, probe first anyway)
-curl -sf --max-time 2 "$HUB/health" | grep -q '"service":"messenger"' \
-  || nohup "$MESSENGER_BIN" serve >>/var/tmp/messenger.log 2>&1 &
-# 3. onboard agents (idempotent — safe every boot). Any kind:
-$MESSENGER_BIN register <agent> --group <jid> --url http://127.0.0.1:<port>/hook       # whatsapp group
-$MESSENGER_BIN register <agent> --kind telegram --token-env BOT_TOKEN --url …          # own bot
-$MESSENGER_BIN register <agent> --kind webhook  --token-env HOOK_SECRET --url …        # own signed path
-# NEVER: run wacli sync/auth yourself, run a second serve, copy the binary elsewhere.
+# → {"channel":"ops","text":"on it","reply_to":"<envelope id>"}     # this exact message
+# → {"channel":"ops","text":"on it","reply_to":"last"}              # the newest inbound (no bookkeeping)
 ```
 
-One group JID = ONE channel — `register`/`channel add` refuse a JID already bound;
-`channel connect <wa>` lists only the FREE groups (bound ones hidden).
+Never fire unthreaded chatter into a group you were answering.
+
+## Receive — your OWN subscription (preferred) or poll
+
+The host owner registers you once (`messenger register <you> --group <jid> --url
+http://127.0.0.1:<port>/hook`). Then:
+
+- Every envelope for YOUR channels is POSTed to your URL **in order**. Answer 2xx fast,
+  process async.
+- Down or slow? Your cursor doesn't advance past an un-acked message — you **catch up**
+  from where you left off. At-least-once → **dedupe by envelope `id`**.
+- No HTTP endpoint? Poll `GET /inbox?since=N` and persist the returned `next` as your `since`.
+- Media: the envelope carries `attachments[]`; fetch bytes via `GET /media/<basename of
+  attachments[].path>` (same bearer).
+
+## The envelope you receive
+
+```json
+{"id":"WA123","channel":"cryptodesk","sender":"…@lid","text":"go flat",
+ "thread_id":"120363410186820001@g.us","reply_to":"","ts":1783267058407,"attachments":[]}
+```
+
+`channel` is your lane's NAME. `id` + `thread_id` are all you need to reply. To answer:
+`POST /send {"channel": env.channel, "text": "…", "reply_to": env.id}`.
+
+## Worked examples
+
+**Crypto desk** (a WhatsApp group lane, receives on its own port):
+```sh
+# host owner, once:  messenger register cryptodesk --group 120363410186820001@g.us --url http://127.0.0.1:9100/hook
+# desk receives a POST at :9100/hook → dedupe by id → decide → reply:
+curl -sS -X POST http://127.0.0.1:14310/send -H "Authorization: Bearer $MESSENGER_SERVE_TOKEN" \
+  -d '{"channel":"cryptodesk","text":"flattened BTC, flat now","reply_to":"last"}'
+```
+
+**CEO** (a Telegram bot lane):
+```sh
+# host owner, once:  messenger register ceo --kind telegram --token-env CEO_BOT_TOKEN --url http://127.0.0.1:9000/hook
+# same contract — CEO sends on channel "ceo", replies with reply_to.
+```
 
 ## Do / Don't
 
 | | |
 |---|---|
-| ✅ probe `/health`, reuse the hub | ❌ `messenger serve` from an agent, tmux, or a second binary |
-| ✅ send via `POST /send` (or `messenger send`) | ❌ `wacli send` / `wacli sync` directly |
-| ✅ own subscription, dedupe by `id` | ❌ polling with someone else's cursor / shared sub names |
+| ✅ probe `/health`, use the running hub | ❌ `messenger serve` / `wacli` from an agent |
+| ✅ send via `POST /send` | ❌ `wacli send` / `wacli sync` directly |
+| ✅ own subscription, dedupe by `id` | ❌ another agent's cursor / a shared subscription name |
 | ✅ `reply_to: env.id` or `"last"` | ❌ unthreaded blasts into shared groups |
-| ✅ ask the host owner for a channel/group | ❌ `channel add` / re-pair from an agent |
+| ✅ send only on YOUR channel(s) | ❌ crossing into another agent's lane |
+| ✅ ask the host owner for a new channel | ❌ `channel add` / re-pair from an agent |
 | ✅ secrets by NAME (`$MESSENGER_SERVE_TOKEN`) | ❌ echoing a secret value into logs/chat |
 
 ## Incident playbook — "WhatsApp went silent"
 
-1. `pgrep -f "messenger (serve|listen)"` → more than one? Kill everything that isn't
-   the canonical binary; re-probe `/health`.
-2. `pgrep -f "wacli.*sync"` → more than one stream = the smoking gun.
-3. `messenger status` + `messenger channel test` on the surviving hub.
-4. Resend a probe message; confirm it lands in `GET /inbox`.
+1. `pgrep -f "messenger (serve|listen)"` → more than one, or one that isn't the managed
+   service? Kill the extras.
+2. `pgrep -f "wacli.*sync"` → more than one stream = the smoking gun (two hubs).
+3. On the surviving hub: `messenger status` + `messenger channel test`.
+4. Send a probe; confirm it lands in `GET /inbox`.

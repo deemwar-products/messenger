@@ -1,135 +1,135 @@
-# messenger — onboarding (zero → working hub)
+# messenger — host setup (so you can use it later)
 
-Follow this top to bottom on a fresh machine and you end with a running conversation
-hub, at least one working channel, a consumer receiving messages, and the agent skill
-installed. Deeper docs: `README.md` (index), `docs/SPEC.md`, `docs/ARCHITECTURE.md`,
-`docs/API.md`, `skills/messenger/` (agent recipes + per-kind references).
+Do this ONCE per host. At the end you have a single messenger hub running as a managed
+OS service (starts on boot, restarts on crash) that sends **and receives** over your
+channels, and any agent (CEO, crypto desk, a script) can drive it over HTTP. How agents
+*use* it: `skills/messenger/references/agents.md`. Deeper docs: `README.md`,
+`docs/SPEC.md` · `docs/ARCHITECTURE.md` · `docs/API.md`.
 
-## 1. Prerequisites
+> **The one rule that makes all of this work:** ONE hub per host. Nothing else runs
+> `messenger serve` or `wacli` — the WhatsApp device is a host-global singleton, and a
+> second `wacli sync` steals it and silently drops inbound. The hub is the sole owner.
 
-- **Go 1.22+** (build only — the artifact is one static binary, `CGO_ENABLED=0`).
-- **wacli** on PATH *only if* you want WhatsApp (https://wacli.sh). Telegram/webhook
-  need nothing extra.
-- A place on PATH for the binary (`~/.local/bin` assumed below).
-
-## 2. Build + install
+## 1. Install the binary
 
 ```sh
+# from a release (no Go needed): download messenger-<os>-<arch> from
+#   https://github.com/deemwar-products/messenger/releases  → chmod +x → put on PATH
+# or with Go:
+go install github.com/deemwar-products/messenger/cmd/messenger@latest   # → ~/go/bin
+# or build from source:
 git clone git@github.com:deemwar-products/messenger.git && cd messenger
 CGO_ENABLED=0 go build -o ~/.local/bin/messenger ./cmd/messenger
-messenger install --skills        # embedded agent skill → ~/.claude/skills/messenger
+
+messenger help          # sanity: prints the verbs
+messenger install --skills   # drop the agent skill into ~/.claude/skills (for AI agents)
 ```
 
-Sanity: `messenger help` prints the verb list.
+State lives in `~/.config/messenger/` on every platform (`config.toml`, `inbox.ndjson`,
+`cursors/`, `media/`). Override with `$MESSENGER_HOME`.
 
-## 3. Scaffold + secrets
+## 2. Scaffold + secrets
 
 ```sh
-messenger setup                   # creates ~/.config/messenger/config.toml (+ prints device state)
+messenger setup    # creates ~/.config/messenger/config.toml + prints the WhatsApp device state
 ```
 
-Secrets are referenced by **NAME** and read from the process environment at the point
-of use — a value never goes in config, code, or output. Export what you'll use (values
-are your own; these are the conventional names):
+Secrets are referenced by **NAME**, never a value — resolved from the environment where
+the **hub** runs. Put them in `~/.config/messenger/serve-token.env` (the service sources
+it at launch; gitignored, never copied into the unit):
 
 ```sh
-export TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN_HERE       # per telegram bot
-export MESSENGER_HOOK_SECRET=YOUR_SHARED_SECRET     # per webhook channel
-export MESSENGER_SERVE_TOKEN=YOUR_API_BEARER        # protects /send + /inbox (optional on loopback)
+# ~/.config/messenger/serve-token.env  — real values here, never printed/committed
+export MESSENGER_SERVE_TOKEN=YOUR_API_BEARER      # protects /send + /inbox + /media
+export MESSENGER_HOOK_SECRET=YOUR_SHARED_SECRET   # per webhook channel
+export TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN          # per telegram bot (if used)
 ```
 
-Put them wherever the hub process starts (shell profile, launchd/systemd environment).
+## 3. WhatsApp: install the prerequisite + pair (skip if you only use telegram/webhook)
 
-## 4. Add channels (pick what you need)
-
-**WhatsApp** — ONE paired device per host; each channel = a group:
+wacli (the WhatsApp engine) is a **manual prerequisite** — messenger never auto-installs
+it, but it can install it for you explicitly:
 
 ```sh
-messenger channel connect anything-yet-to-exist 2>/dev/null || true   # optional peek
-messenger channel add whatsapp ops --group 123456789@g.us
-messenger channel connect ops     # already linked → prints JID + group list; else ONE QR pair
+messenger install --wacli          # brew install openclaw/tap/wacli (macOS); prints the line elsewhere
+messenger channel add whatsapp <name> --group <group-jid>   # bind a channel to a group
+messenger channel connect <name>   # already linked → shows JID + FREE groups; else scan the QR ONCE
 ```
 
-Don't know the group JID? `messenger channel connect ops` lists known groups (run
-`wacli sync` once if the list is empty). A whatsapp channel with **no** `--group` is
-the catch-all for DMs/unlisted groups.
+- The device is **global** — pair once, it serves every whatsapp channel.
+- **One group = one channel.** A chat with no bound channel is **dropped** (no
+  catch-all). `channel connect` lists only the FREE (unbound) groups so you can pick a JID.
+- To remove WhatsApp later: `messenger uninstall --wacli` (unlinks the device, then removes wacli).
 
-**Telegram** — one bot per channel (create the bot via @BotFather first):
+## 4. Telegram / webhook channels (as needed)
 
 ```sh
+# telegram — one bot per channel (create it via @BotFather first):
 messenger channel add telegram mybot --token-env TELEGRAM_BOT_TOKEN --chat-id -1001234567890
-messenger channel connect mybot --public-url https://your-host   # prints the setWebhook curl — run it
-```
+messenger channel connect mybot --public-url https://your-host    # prints the setWebhook curl — run it
 
-Inbound needs the hub reachable at that public URL (tunnel/reverse proxy); outbound
-works immediately.
-
-**Webhook** — for scripts/CI/bridges:
-
-```sh
+# webhook — a signed inbound path for scripts/CI/bridges:
 messenger channel add webhook incoming --token-env MESSENGER_HOOK_SECRET
 ```
 
-## 5. Verify BEFORE running
+Telegram inbound needs the hub reachable at the public URL (tunnel/reverse proxy);
+outbound works immediately.
+
+## 5. Verify before running
 
 ```sh
-messenger channel test            # whatsapp device+group · telegram getMe · webhook secret
-messenger status                  # config, channels, device, inbox, subscriptions
+messenger channel test    # whatsapp device+group · telegram getMe · webhook secret — exits non-zero on failure
+messenger channel list
 ```
 
-Fix anything ✗ now — `test` exits non-zero and names the problem (e.g. "env
-TELEGRAM_BOT_TOKEN is unset", "group … not in the local store").
-
-## 6. Run the hub (ONE per host)
+## 6. Run the hub as a service (the "use it later" part)
 
 ```sh
-messenger serve                   # :14310 — channel webhooks + /send + /inbox + /media + dispatcher
+source ~/.config/messenger/serve-token.env    # so install picks up the secrets' presence
+messenger install --service                    # launchd (macOS) / systemd --user (Linux)
 ```
 
-It probes first and **reuses** a running hub instead of double-starting. For boot
-persistence wrap exactly this command in launchd/systemd with the env vars from step 3.
-
-Smoke test:
+This installs ONE managed hub that **starts on boot and restarts on crash**, sourcing
+your `serve-token.env` at launch (only its path is in the unit, never a value) and baking
+your PATH so it can find `wacli`. It refuses if a hub is already running.
 
 ```sh
-curl -sS http://127.0.0.1:14310/health     # {"ok":true,"service":"messenger","channels":{...}}
-messenger send --channel ops --text "hub is up"
-messenger send --channel ops --file ./README.md --text "with an attachment"
+curl -sS http://127.0.0.1:14310/health    # {"ok":true,"service":"messenger","channels":{…}}
+messenger status                          # shows: server RUNNING, channels, device, inbox, subscriptions
+messenger uninstall --service             # remove it cleanly when you want
 ```
 
-## 7. Wire a consumer
+(For a quick dev run without a service: `messenger serve` — it probes and reuses a
+running hub instead of double-starting.)
+
+## 7. Onboard your consumers (CEO, crypto desk, …)
+
+One idempotent command per agent gives it a lane + a durable listen, and prints its exact
+send/reply/receive contract:
 
 ```sh
-messenger subscribe add myapp --url http://localhost:9000/hook            # all channels
+# a whatsapp group lane:
+messenger register cryptodesk --group 120363410186820001@g.us --url http://127.0.0.1:9100/hook
+# a telegram bot lane:
+messenger register ceo --kind telegram --token-env CEO_BOT_TOKEN --url http://127.0.0.1:9000/hook
+# a webhook lane (scripted):
+messenger register ci --kind webhook --token-env CI_HOOK_SECRET --url http://127.0.0.1:9300/hook
 ```
 
-Your endpoint gets every envelope POSTed in order; answer 2xx. Down = automatic
-catch-up from your cursor (at-least-once — dedupe by envelope `id`). Reply to anything
-with `POST /send {"channel":..., "text":..., "reply_to":"last"}`. Ad-hoc scripts can
-poll `GET /inbox?since=N` instead. Attachments ride the envelope; fetch bytes via
-`GET /media/<basename of attachments[].path>`.
-
-## 8. For AI agents
-
-`messenger install --skills` (already done in step 2) gives any Claude Code session the
-full playbook: hub detection/reuse, send/reply/poll/subscribe recipes, per-kind
-references. Restart the agent session once to pick it up.
+Each consumer then receives every envelope for its channels POSTed to its URL, in order,
+and replies via `POST /send`. Full agent-side contract: `references/agents.md`. Restart
+the hub after adding channels/subscriptions so it reloads: `messenger uninstall --service
+&& messenger install --service` (or just `install --service` again).
 
 ## Troubleshooting
 
 | symptom | fix |
 |---|---|
-| `messenger serve` says "already running — reusing" | That's correct behavior. Talk to the running hub; don't start a second. |
-| whatsapp channel silent | `messenger channel test <name>`: device linked? group JID known? Then check `wacli doctor --json` (`connected` state) and the serve log ("whatsapp stream exited … restarting"). |
-| telegram inbound silent, outbound fine | setWebhook never ran or the public URL isn't reachable — re-run `channel connect <name> --public-url …` and execute the printed curl. |
-| `401` on /send, /inbox, /media | Send `Authorization: Bearer $MESSENGER_SERVE_TOKEN` (the env var named by `serveTokenEnv`). |
-| `401 signature verification failed` on /webhook/<name> | Sign the EXACT raw bytes you POST (no re-encoding); header `X-Hub-Signature-256: sha256=<hex>`. |
-| `409 no previous message … to reply to` | The conversation is empty — send without `reply_to`. |
-| token errors on send | The env var named by `--token-env` isn't set in the HUB's environment (not just your shell). |
-| second machine, same WhatsApp number | Don't. One paired device per host; point other machines at this hub over HTTP. |
-
-## Green gate (before any commit)
-
-```sh
-CGO_ENABLED=0 go build ./... && go vet ./... && CGO_ENABLED=0 go test ./...
-```
+| WhatsApp went silent | `pgrep -f "wacli.*sync"` → more than one = two hubs fighting the device. Kill all but the service; `messenger status`. |
+| `install --service` refuses | A hub is already running — stop it first (`pkill -f "messenger serve"` or `uninstall --service`), then reinstall. |
+| service up but `wacli: not found` | Reinstall the service from a shell where `which wacli` works — it bakes that PATH. |
+| whatsapp channel receives nothing | `messenger channel test <name>` — device linked? group JID bound? A no-group channel receives nothing by design. |
+| telegram inbound silent, outbound fine | setWebhook never ran / public URL unreachable — re-run `channel connect <name> --public-url …` and run the printed curl. |
+| `401` on /send, /inbox, /media | Send `Authorization: Bearer $MESSENGER_SERVE_TOKEN`. |
+| channel added but hub doesn't see it | The hub loads config at start — restart it (`install --service` again). |
+| second machine, same WhatsApp number | Don't. One device per host; point other machines at this hub over HTTP. |
