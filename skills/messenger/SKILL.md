@@ -25,6 +25,10 @@ need to reply; media rides as `attachments` (send: Recipe 2, fetch: Recipe 4). D
 port **:14310**; state in `$MESSENGER_HOME` (default `~/.config/messenger`):
 `config.toml`, `inbox.ndjson`, `media/`, `cursors/<consumer>`.
 
+**READ FIRST — `references/agents.md`:** the operating contract every agent MUST follow
+(one hub per host, discover-never-serve, own subscription, incident playbook). The
+recipes below are how; that file is the law.
+
 **Channel-kind specifics live in `references/` — read the one you're working with:**
 
 - `references/whatsapp.md` — ONE global paired device, channels = groups, catch-all,
