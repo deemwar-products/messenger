@@ -21,12 +21,25 @@ messenger channel test incoming    # secret resolvable? path? callback?
 
 ## Inject a message (inbound)
 
-Sign the raw body with HMAC-SHA256, hex, prefixed `sha256=`:
+Same host as the hub? Use the verb — it loads the channel from config, resolves the
+secret by NAME the same way the server does, signs the exact raw bytes, and POSTs to
+the running hub:
+
+```sh
+messenger inject --channel incoming --text "deploy done" --sender ci --thread run-42 [--reply-to MSGID] [--addr :14310]
+# → injected id=… channel=incoming    (202 → envelope flows to inbox + all subscriptions)
+```
+
+Non-zero exit + a one-line hint on failure: 401 = the hub resolves a different secret
+than your shell; "hub unreachable" = start it (`messenger serve`).
+
+**Cross-host fallback** (no binary/config where the caller runs): sign the raw body
+with HMAC-SHA256, hex, prefixed `sha256=`:
 
 ```sh
 body='{"text":"deploy done","sender":"ci","thread_id":"run-42"}'
 sig="sha256=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$MESSENGER_HOOK_SECRET" -hex | awk '{print $NF}')"
-curl -sS -X POST http://127.0.0.1:14310/webhook/incoming -H "X-Hub-Signature-256: $sig" -d "$body"
+curl -sS -X POST http://<hub-host>:14310/webhook/incoming -H "X-Hub-Signature-256: $sig" -d "$body"
 # 202 Accepted → envelope flows to inbox + all subscriptions
 ```
 

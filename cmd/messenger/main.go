@@ -7,6 +7,7 @@
 //	messenger subscribe  add / list / remove durable consumer push subscriptions
 //	messenger listen     ingress + subscription dispatch (no consumer API)
 //	messenger send       one-shot egress; prints the provider-assigned message id
+//	messenger inject     sign + POST a message INTO the running hub via a webhook channel
 //	messenger serve      everything on one port: channel webhooks + POST /send,
 //	                     GET /inbox?since=N, GET /health + the subscription dispatcher
 //
@@ -60,6 +61,8 @@ func main() {
 		err = cmdListen(os.Args[2:])
 	case "send":
 		err = cmdSend(os.Args[2:])
+	case "inject":
+		err = cmdInject(os.Args[2:])
 	case "serve":
 		err = cmdServe(os.Args[2:])
 	case "install":
@@ -95,6 +98,8 @@ usage:
   messenger listen [--addr :14310] [--webhook URL]
   messenger send   --channel <name> [--text "hi"] [--file PATH|URL] [--to THREAD] [--reply-to MSGID]
                                            (--text and/or --file; --file attaches a local path or http(s) URL)
+  messenger inject --channel <webhook-name> --text "MSG" [--sender NAME] [--thread ID] [--reply-to MSGID]
+                                           (scripted ingress: signs + POSTs to the running hub's /webhook/<name>)
   messenger serve  [--addr :14310]
 
 kinds:
@@ -656,12 +661,8 @@ func cmdInstall(args []string) error {
 // instead of double-binding channels (a second telegram webhook consumer or wacli
 // stream would split/steal messages).
 func probeRunning(addr string) bool {
-	hostport := addr
-	if strings.HasPrefix(hostport, ":") {
-		hostport = "127.0.0.1" + hostport
-	}
 	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get("http://" + hostport + "/health")
+	resp, err := client.Get(baseURLFor(addr) + "/health")
 	if err != nil {
 		return false
 	}
@@ -671,6 +672,15 @@ func probeRunning(addr string) bool {
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&h)
 	return h.Service == "messenger"
+}
+
+// baseURLFor turns a listen addr (":14310" or "host:port") into the loopback-default
+// base URL CLI verbs use to reach the running hub.
+func baseURLFor(addr string) string {
+	if strings.HasPrefix(addr, ":") {
+		addr = "127.0.0.1" + addr
+	}
+	return "http://" + addr
 }
 
 func envNameOr(name, fallback string) string {
@@ -916,6 +926,107 @@ func cmdSend(args []string) error {
 	}
 	fmt.Printf("sent id=%s channel=%s\n", id, env.Channel)
 	return nil
+}
+
+// cmdInject injects one message INTO the running hub through a webhook channel — the
+// first-class replacement for the manual openssl+curl HMAC dance. The channel's secret
+// is resolved by NAME exactly as the server resolves it (SecretResolver: vault entry,
+// else env var), the exact raw body bytes are signed, and the result is POSTed to the
+// hub's /webhook/<name>. The secret value never appears in output.
+func cmdInject(args []string) error {
+	fs := flag.NewFlagSet("inject", flag.ContinueOnError)
+	cfgPath := fs.String("config", "", "config path")
+	ch := fs.String("channel", "", "webhook channel NAME to inject on")
+	text := fs.String("text", "", "message text")
+	sender := fs.String("sender", "", "sender label (default $USER)")
+	thread := fs.String("thread", "", "thread id the message belongs on")
+	replyTo := fs.String("reply-to", "", "message id this injection replies to")
+	addr := fs.String("addr", ":14310", "address of the running hub")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *ch == "" || *text == "" {
+		return fmt.Errorf("--channel and --text are required")
+	}
+	cfg, err := loadConfig(*cfgPath)
+	if err != nil {
+		return err
+	}
+	t, ok := cfg.Transports[*ch]
+	if !ok {
+		return fmt.Errorf("no channel named %q", *ch)
+	}
+	kind := channel.NormalizeKind(t.Kind, *ch)
+	if kind != "webhook" {
+		return fmt.Errorf("channel %q is kind %s — inject needs a webhook channel (add one: messenger channel add webhook <name> --token-env NAME)", *ch, kind)
+	}
+	// Same resolution path as the serving hub; the error names the source, never a value.
+	secret, err := channel.NewSecretResolver(nil).Token(t)
+	if err != nil {
+		return err
+	}
+	if *sender == "" {
+		*sender = os.Getenv("USER")
+	}
+	body, id, err := injectBody(*text, *sender, *thread, *replyTo)
+	if err != nil {
+		return err
+	}
+	path := t.Options["path"]
+	if path == "" {
+		path = "/webhook/" + *ch
+	}
+	sigHeader := t.Options["signatureHeader"]
+	if sigHeader == "" {
+		sigHeader = "X-Hub-Signature-256"
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	if err := injectPost(client, baseURLFor(*addr), path, sigHeader, []byte(secret), body); err != nil {
+		return err
+	}
+	fmt.Printf("injected id=%s channel=%s\n", id, *ch)
+	return nil
+}
+
+// injectBody builds the exact raw bytes that are signed and posted — the webhook body
+// shape the hub normalizes (references/webhook.md), empties omitted. The id is minted
+// here so the caller can print the same identity the inbox envelope carries.
+func injectBody(text, sender, thread, replyTo string) ([]byte, string, error) {
+	id := envelope.Normalize(envelope.Envelope{}).ID
+	p := struct {
+		ID       string `json:"id"`
+		Text     string `json:"text"`
+		Sender   string `json:"sender,omitempty"`
+		ThreadID string `json:"thread_id,omitempty"`
+		ReplyTo  string `json:"reply_to,omitempty"`
+	}{ID: id, Text: text, Sender: sender, ThreadID: thread, ReplyTo: replyTo}
+	body, err := json.Marshal(p)
+	return body, id, err
+}
+
+// injectPost signs body under secret and POSTs it to the hub at baseURL+path. Split
+// from cmdInject so tests can stand an httptest server in for the hub. Failures come
+// back with a one-line hint; the secret value never enters an error.
+func injectPost(client *http.Client, baseURL, path, sigHeader string, secret, body []byte) error {
+	req, err := http.NewRequest(http.MethodPost, baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(sigHeader, channel.SignHMAC(secret, body))
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("hub unreachable at %s (start it: messenger serve): %w", baseURL, err)
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusAccepted:
+		return nil
+	case http.StatusUnauthorized:
+		return fmt.Errorf("hub rejected the signature (401) — the hub resolves a different secret for this channel than this shell")
+	default:
+		return fmt.Errorf("hub answered %d for %s", resp.StatusCode, path)
+	}
 }
 
 // cmdServe runs everything on one port: channel webhooks, the consumer API, and the

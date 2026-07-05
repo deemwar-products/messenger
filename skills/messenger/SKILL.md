@@ -129,7 +129,18 @@ up automatically (at-least-once — dedupe by envelope `id`). With `--secret-env
 
 ## Recipe 6 — inject a message from a script
 
-Use a webhook channel — full signing recipe in `references/webhook.md`.
+Any local agent/script lands a message in the hub inbox through a webhook channel —
+one verb, no HMAC dance:
+
+```sh
+messenger inject --channel incoming --text "deploy done" --sender ci --thread run-42
+# → injected id=… channel=incoming    (202 from the running hub; flows to inbox + subscriptions)
+```
+
+The channel's secret is resolved by NAME (e.g. `$MESSENGER_HOOK_SECRET`) exactly as the
+hub resolves it — export it in the calling shell; the value is never printed. `--reply-to
+MSGID` threads, `--addr` reaches a non-default hub. Cross-host (no binary/config on the
+caller)? The raw signed-curl recipe lives in `references/webhook.md`.
 
 ## Recipe 7 — diagnose
 
