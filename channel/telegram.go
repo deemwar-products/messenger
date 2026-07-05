@@ -22,6 +22,74 @@ import (
 
 var httpClient = &http.Client{Timeout: 15 * time.Second}
 
+// telegramKind is the whole kind: wire behavior + CLI behavior. Every telegram channel
+// is its OWN bot; one bot has ONE webhook, so a bot belongs to exactly one consumer.
+type telegramKind struct{ Base }
+
+func init() { Register(telegramKind{}) }
+
+func (telegramKind) Name() string   { return "telegram" }
+func (telegramKind) Traits() Traits { return Traits{RequiresToken: true, TargetFlag: "chat-id"} }
+
+func (telegramKind) Open(name string, cfg config.Transport, res *SecretResolver) (Channel, error) {
+	return openTelegram(name, cfg, res)
+}
+
+func (telegramKind) Test(ctx context.Context, name string, cfg config.Transport, res *SecretResolver) ([]string, error) {
+	return testTelegram(ctx, name, cfg, res)
+}
+
+func (telegramKind) AddHints(name string, cfg config.Transport) []string {
+	return []string{fmt.Sprintf("register the webhook: messenger channel connect %s --public-url https://<host>", name)}
+}
+
+// Connect prints the setWebhook call to run against the bot token — the token is
+// referenced by NAME and never enters this output.
+func (telegramKind) Connect(name string, cfg config.Transport, p ConnectParams) error {
+	path := cfg.Options["path"]
+	if path == "" {
+		path = "/telegram/" + name
+	}
+	if p.PublicURL == "" {
+		fmt.Printf("telegram %q webhook path is %s\n", name, path)
+		fmt.Printf("re-run with --public-url https://<host> to print the setWebhook call\n")
+		return nil
+	}
+	fmt.Printf("set the webhook (run against your bot token, kept out of this output):\n")
+	fmt.Printf("  curl -sS \"https://api.telegram.org/bot$%s/setWebhook\" -d \"url=%s%s\"\n",
+		envNameOr(cfg.TokenEnv, "TELEGRAM_BOT_TOKEN"), strings.TrimRight(p.PublicURL, "/"), path)
+	return nil
+}
+
+func (telegramKind) Detail(name string, cfg config.Transport) string {
+	if id := cfg.Options["chatId"]; id != "" {
+		return "chat=" + id
+	}
+	return ""
+}
+
+// Lane: an agent's telegram lane is its OWN bot (token by NAME) + default chat.
+func (telegramKind) Lane(name string, p LaneParams, _ map[string]config.Transport) (config.Transport, []string, error) {
+	if p.TokenEnv == "" {
+		return config.Transport{}, nil, fmt.Errorf("telegram lanes need a bot: pass --token-env NAME (one bot per agent)")
+	}
+	var opts map[string]string
+	if p.ChatID != "" {
+		opts = map[string]string{"chatId": p.ChatID}
+	}
+	want := config.Transport{Enabled: true, Kind: "telegram", TokenEnv: p.TokenEnv, Options: opts}
+	return want, []string{fmt.Sprintf("channel %q → telegram bot ($%s) — next: messenger channel connect %s --public-url https://<host>", name, p.TokenEnv, name)}, nil
+}
+
+// envNameOr returns the configured env-var NAME or the conventional fallback (names
+// only — never a value).
+func envNameOr(name, fallback string) string {
+	if name != "" {
+		return name
+	}
+	return fallback
+}
+
 // telegramChannel is one Telegram bot: inbound via the Bot API webhook (Telegram POSTs
 // Updates to /telegram/<name>), outbound via sendMessage. Every telegram channel is its
 // own bot — own token by NAME, own default chat id. Telegram optionally signs the

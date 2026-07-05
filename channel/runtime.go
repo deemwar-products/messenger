@@ -77,12 +77,12 @@ func (rt *Runtime) Up(ctx context.Context) error {
 	sharedKinds := map[string]map[string]config.Transport{}
 
 	for name, cfg := range rt.seed {
-		spec, err := SpecFor(name, cfg)
+		k, err := KindFor(name, cfg)
 		if err != nil {
 			errs = append(errs, err)
 			continue
 		}
-		ch, err := spec.Open(name, cfg, rt.res)
+		ch, err := k.Open(name, cfg, rt.res)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("channel: open %q: %w", name, err))
 			continue
@@ -97,18 +97,18 @@ func (rt *Runtime) Up(ctx context.Context) error {
 				rt.mux.Handle("/hook/"+name, p.Handler(rt.pub))
 			}
 		}
-		if spec.Shared && spec.OpenStream != nil {
-			if sharedKinds[spec.Name] == nil {
-				sharedKinds[spec.Name] = map[string]config.Transport{}
+		// Streaming kinds get ONE shared inbound stream over all their channels.
+		if _, ok := k.(Streaming); ok {
+			if sharedKinds[k.Name()] == nil {
+				sharedKinds[k.Name()] = map[string]config.Transport{}
 			}
-			sharedKinds[spec.Name][name] = cfg
+			sharedKinds[k.Name()][name] = cfg
 		}
 	}
 
-	// One stream per shared kind, no matter how many channels of that kind exist.
+	// One stream per streaming kind, no matter how many channels of that kind exist.
 	for kind, chans := range sharedKinds {
-		spec := Kinds()[kind]
-		st, err := spec.OpenStream(chans, rt.res)
+		st, err := Kinds()[kind].(Streaming).OpenStream(chans, rt.res)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("channel: %s stream: %w", kind, err))
 			continue
@@ -185,11 +185,11 @@ func (rt *Runtime) Send(ctx context.Context, env envelope.Envelope) (string, err
 func OpenSend(cfg *config.Config, res *SecretResolver) *Runtime {
 	rt := NewRuntime(cfg.Enabled(), res, func(envelope.Envelope) {})
 	for name, tcfg := range rt.seed {
-		spec, err := SpecFor(name, tcfg)
+		k, err := KindFor(name, tcfg)
 		if err != nil {
 			continue
 		}
-		if ch, err := spec.Open(name, tcfg, rt.res); err == nil {
+		if ch, err := k.Open(name, tcfg, rt.res); err == nil {
 			rt.channels[name] = ch
 		}
 	}

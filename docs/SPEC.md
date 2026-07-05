@@ -27,19 +27,28 @@ webhook hooks  ─┘
 ## Channel kinds — one common interface, per-kind multiplicity
 
 ```go
-type Channel interface {          // one type per kind: telegram / whatsapp / webhook
+type Channel interface {          // one instance per configured channel
     Name() string; Kind() string
     Send(ctx, env Envelope) (providerID string, err error)
 }
 type Pushed   interface { Channel; Path() string; Handler(pub Publisher) http.Handler }
-type Streamer interface { Run(ctx, pub Publisher) error }   // kind-level shared stream
+type Streamer interface { Run(ctx, pub Publisher) error }
 
-type KindSpec struct {
-    Name          string
-    Shared        bool   // ONE runtime stream serves ALL channels of this kind
-    RequiresToken bool
-    Open          func(name, cfg, resolver) (Channel, error)
-    OpenStream    func(allChannelsOfKind, resolver) (Streamer, error) // nil = pushed-only
+// Kind is the polymorphic face of one kind — wire AND CLI behavior on one type,
+// so main.go dispatches with zero kind conditionals. Base supplies neutral defaults.
+type Kind interface {
+    Name() string; Traits() Traits                    // {RequiresToken, TargetFlag}
+    Open(name, cfg, resolver) (Channel, error)
+    Validate(name, cfg, existing) error               // add-time rules (wa: 1 JID = 1 channel)
+    AddHints(name, cfg) []string                      // post-add guidance
+    Connect(name, cfg, ConnectParams) error           // pair/register (wa: QR + FREE-group list)
+    Test(ctx, name, cfg, resolver) ([]string, error)  // connectivity probe
+    Detail(name, cfg) string                          // `channel list` target column
+    Lane(name, LaneParams, existing) (Transport, hints, error)  // `register` agent lanes
+    Status() []string                                 // host-level state (wa: device)
+}
+type Streaming interface {                            // capability: ONE shared stream per kind
+    OpenStream(allChannelsOfKind, resolver) (Streamer, error)
 }
 ```
 
@@ -125,12 +134,13 @@ double-starting. Multiple installs/agents all talk to the one hub over HTTP.
 
 ## Extending with new kinds (teams, slack, …)
 
-A new kind is ONE file in `channel/`: a type implementing `Channel` (plus `Pushed` for
-HTTP-pushed inbound or a kind-level `Streamer` for long-lived streams), registered via
-`channel.Register(KindSpec{Name, Shared?, RequiresToken?, TargetFlag?, Open, OpenStream?,
-Test?})`. The CLI (`channel add/list/connect/test`), the runtime supervision, `/send`,
-subscriptions, and threading all work unchanged — no parallel registries, no server or
-CLI edits beyond kind-specific connect/test hints.
+A new kind is ONE file in `channel/`: a struct embedding `channel.Base` that implements
+`Name`, `Traits`, `Open` (plus `Streaming` when its inbound is one shared stream, and
+whichever CLI hooks it has — `Validate/AddHints/Connect/Test/Detail/Lane/Status`), and
+one `channel.Register(teamsKind{})` in its `init()`. The CLI (`channel
+add/list/connect/test`, `register`), the runtime supervision, `/send`, subscriptions,
+and threading all work with ZERO edits elsewhere — main.go contains no kind
+conditionals at all.
 
 ## Invariants
 

@@ -15,6 +15,59 @@ import (
 	"github.com/deemwar-products/messenger/envelope"
 )
 
+// webhookKind is the whole kind: wire behavior + CLI behavior. Every hook is its own
+// channel with its own path and HMAC secret (by NAME).
+type webhookKind struct{ Base }
+
+func init() { Register(webhookKind{}) }
+
+func (webhookKind) Name() string   { return "webhook" }
+func (webhookKind) Traits() Traits { return Traits{RequiresToken: true} }
+
+func (webhookKind) Open(name string, cfg config.Transport, res *SecretResolver) (Channel, error) {
+	return openWebhook(name, cfg, res)
+}
+
+func (webhookKind) Test(ctx context.Context, name string, cfg config.Transport, res *SecretResolver) ([]string, error) {
+	return testWebhook(ctx, name, cfg, res)
+}
+
+func (webhookKind) AddHints(name string, cfg config.Transport) []string {
+	return []string{fmt.Sprintf("inbound path: %s (HMAC X-Hub-Signature-256 with $%s)",
+		webhookPath(name, cfg), envNameOr(cfg.TokenEnv, "MESSENGER_HOOK_SECRET"))}
+}
+
+// Connect prints a signed-call example — no pairing needed; the secret stays a NAME.
+func (webhookKind) Connect(name string, cfg config.Transport, _ ConnectParams) error {
+	p := webhookPath(name, cfg)
+	secret := envNameOr(cfg.TokenEnv, "MESSENGER_HOOK_SECRET")
+	fmt.Printf("webhook %q needs no pairing. callers POST to %s signed with $%s:\n", name, p, secret)
+	fmt.Printf("  sig=\"sha256=$(printf '%%s' \"$BODY\" | openssl dgst -sha256 -hmac \"$%s\" -hex | awk '{print $NF}')\"\n", secret)
+	fmt.Printf("  curl -sS -X POST \"http://<host>%s\" -H \"X-Hub-Signature-256: $sig\" -d \"$BODY\"\n", p)
+	return nil
+}
+
+func (webhookKind) Detail(name string, cfg config.Transport) string {
+	return "path=" + webhookPath(name, cfg)
+}
+
+// Lane: an agent's webhook lane is its own signed inject path.
+func (webhookKind) Lane(name string, p LaneParams, _ map[string]config.Transport) (config.Transport, []string, error) {
+	if p.TokenEnv == "" {
+		return config.Transport{}, nil, fmt.Errorf("webhook lanes need a secret: pass --token-env NAME")
+	}
+	want := config.Transport{Enabled: true, Kind: "webhook", TokenEnv: p.TokenEnv}
+	return want, []string{fmt.Sprintf("channel %q → webhook /webhook/%s (HMAC $%s)", name, name, p.TokenEnv)}, nil
+}
+
+// webhookPath is the channel's inbound mount (options["path"] override).
+func webhookPath(name string, cfg config.Transport) string {
+	if p := cfg.Options["path"]; p != "" {
+		return p
+	}
+	return "/webhook/" + name
+}
+
 // webhookChannel is the generic HMAC-signed channel — every hook is its own channel
 // with its own path and secret. Inbound: a caller POSTs a body plus an
 // X-Hub-Signature-256 header (sha256=<hex>) computed over the body with the shared

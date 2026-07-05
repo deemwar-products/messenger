@@ -19,12 +19,8 @@ package channel
 
 import (
 	"context"
-	"fmt"
 	"net/http"
-	"sort"
-	"sync"
 
-	"github.com/deemwar-products/messenger/config"
 	"github.com/deemwar-products/messenger/envelope"
 )
 
@@ -57,107 +53,5 @@ type Streamer interface {
 	Run(ctx context.Context, pub Publisher) error
 }
 
-// KindSpec captures one kind's rules: how many channels it supports, what config it
-// requires, how to open a channel, and (for Shared kinds) how to open the ONE stream
-// that serves all of them.
-type KindSpec struct {
-	Name          string
-	Shared        bool   // one runtime stream serves ALL channels of this kind
-	RequiresToken bool   // channel add must name a token (env or vault)
-	TargetFlag    string // the add-flag naming the default target ("chat-id", "group", "")
-
-	// Open builds the per-channel value (Send + optionally Pushed).
-	Open func(name string, cfg config.Transport, res *SecretResolver) (Channel, error)
-	// OpenStream builds the kind's single shared inbound stream over every enabled
-	// channel of this kind. Nil for pushed-only kinds.
-	OpenStream func(chans map[string]config.Transport, res *SecretResolver) (Streamer, error)
-	// Test probes connectivity for one channel WITHOUT sending a message: whatsapp
-	// checks the global device, telegram calls getMe with the token (by NAME),
-	// webhook verifies the secret is resolvable. It returns human-readable lines;
-	// a secret value never appears in them. Nil = nothing to test.
-	Test func(ctx context.Context, name string, cfg config.Transport, res *SecretResolver) ([]string, error)
-}
-
-// kinds is the mutable kind registry. Built-ins register in init(); a new kind
-// (teams, slack, …) is ONE file implementing Channel (+ Pushed or a Streamer) plus a
-// Register call — never a parallel registry.
-var (
-	kindsMu sync.RWMutex
-	kinds   = map[string]KindSpec{}
-)
-
-// Register adds a kind to the registry. A duplicate name panics (init-order bug).
-func Register(spec KindSpec) {
-	kindsMu.Lock()
-	defer kindsMu.Unlock()
-	if spec.Name == "" || spec.Open == nil {
-		panic("channel: Register needs Name and Open")
-	}
-	if _, dup := kinds[spec.Name]; dup {
-		panic(fmt.Sprintf("channel: kind %q registered twice", spec.Name))
-	}
-	kinds[spec.Name] = spec
-}
-
-func init() {
-	Register(KindSpec{
-		Name: "telegram", RequiresToken: true, TargetFlag: "chat-id",
-		Open: openTelegram,
-		Test: testTelegram,
-	})
-	Register(KindSpec{
-		Name: "whatsapp", Shared: true, TargetFlag: "group",
-		Open:       openWhatsapp,
-		OpenStream: openWhatsappStream,
-		Test:       testWhatsapp,
-	})
-	Register(KindSpec{
-		Name: "webhook", RequiresToken: true,
-		Open: openWebhook,
-		Test: testWebhook,
-	})
-}
-
-// Kinds returns a snapshot of the registry, keyed by canonical name.
-func Kinds() map[string]KindSpec {
-	kindsMu.RLock()
-	defer kindsMu.RUnlock()
-	out := make(map[string]KindSpec, len(kinds))
-	for k, v := range kinds {
-		out[k] = v
-	}
-	return out
-}
-
-// KindNames returns the canonical kind names, sorted.
-func KindNames() []string {
-	ks := Kinds()
-	out := make([]string, 0, len(ks))
-	for k := range ks {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
-}
-
-// NormalizeKind maps a configured kind to its canonical spec name. "hook" is the legacy
-// alias for "webhook"; an empty kind defaults to the channel name.
-func NormalizeKind(kind, channelName string) string {
-	if kind == "" {
-		kind = channelName
-	}
-	if kind == "hook" {
-		return "webhook"
-	}
-	return kind
-}
-
-// SpecFor resolves the KindSpec for a channel's config.
-func SpecFor(name string, cfg config.Transport) (KindSpec, error) {
-	kind := NormalizeKind(cfg.Kind, name)
-	spec, ok := Kinds()[kind]
-	if !ok {
-		return KindSpec{}, fmt.Errorf("channel: unknown kind %q (channel %q)", kind, name)
-	}
-	return spec, nil
-}
+// The kind registry, the Kind interface (one polymorphic type per kind, CLI behavior
+// included), and its Base defaults live in kind.go.

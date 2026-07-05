@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
@@ -95,8 +94,9 @@ usage:
   messenger channel list | remove <name> | connect <name> [--public-url URL]
   messenger channel test [<name>]          probe connectivity (whatsapp device, telegram getMe, webhook secret)
   messenger install --skills               install the embedded agent skill into ~/.claude/skills
-  messenger register <agent> [--group <jid>] [--channels a,b] [--url URL] [--secret-env NAME]
-                                           one-shot agent onboarding: lane + listen (idempotent)
+  messenger register <agent> [--group <jid> | --kind telegram|webhook --token-env NAME [--chat-id ID]]
+                             [--channels a,b] [--url URL] [--secret-env NAME]
+                                           one-shot agent onboarding: lane (any kind) + listen (idempotent)
   messenger subscribe add <name> --url URL [--channels a,b] [--secret-env NAME]
   messenger subscribe list | remove <name>
   messenger listen [--addr :14310] [--webhook URL]
@@ -189,7 +189,7 @@ func cmdSetup(args []string) error {
 		}
 		fmt.Printf("scaffolded home + empty config at %s\n", path)
 	}
-	printWhatsappHint()
+	printKindStatus()
 	fmt.Print(`
 next — add channels (many of any kind, keyed by name):
   messenger channel add whatsapp ops --group 123456789@g.us
@@ -207,19 +207,13 @@ secrets are referenced by NAME only — export the values, never printed here.
 	return nil
 }
 
-// printWhatsappHint reports the GLOBAL device state so the user knows whether pairing
-// is even needed.
-func printWhatsappHint() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	st := channel.WhatsappDeviceStatus(ctx, "")
-	switch {
-	case !st.Installed:
-		fmt.Println("whatsapp: wacli not found on PATH — install it to use whatsapp channels")
-	case st.Authenticated:
-		fmt.Printf("whatsapp: device already linked (%s) — no pairing needed, just add group channels\n", st.LinkedJID)
-	default:
-		fmt.Println("whatsapp: wacli installed but not paired — `messenger channel connect <name>` will run the QR pair once")
+// printKindStatus reports every kind's host-level state (whatsapp: the global device's
+// pair state) — setup/status ask each kind polymorphically.
+func printKindStatus() {
+	for _, n := range channel.KindNames() {
+		for _, line := range channel.Kinds()[n].Status() {
+			fmt.Println(line)
+		}
 	}
 }
 
@@ -251,7 +245,7 @@ func cmdStatus(args []string) error {
 	}
 	fmt.Printf("channels: %d configured\n", len(cfg.Transports))
 	_ = channelListPrint(cfg)
-	printWhatsappHint()
+	printKindStatus()
 
 	if msgs, next, err := (&inboxAt{home.InboxPath()}).count(); err == nil {
 		fmt.Printf("inbox: %d messages (%s)\n", next, home.InboxPath())
@@ -336,23 +330,11 @@ func channelListPrint(cfg *config.Config) error {
 	fmt.Printf("%-16s %-10s %-8s %s\n", "NAME", "KIND", "ENABLED", "TARGET")
 	for _, n := range names {
 		t := cfg.Transports[n]
-		kind := channel.NormalizeKind(t.Kind, n)
 		detail := ""
-		switch {
-		case t.Options["group"] != "":
-			detail = "group=" + t.Options["group"]
-		case t.Options["chatId"] != "":
-			detail = "chat=" + t.Options["chatId"]
-		case kind == "whatsapp":
-			detail = "(catch-all: unmatched chats land here)"
-		case kind == "webhook":
-			p := t.Options["path"]
-			if p == "" {
-				p = "/webhook/" + n
-			}
-			detail = "path=" + p
+		if k, err := channel.KindFor(n, t); err == nil {
+			detail = k.Detail(n, t)
 		}
-		fmt.Printf("%-16s %-10s %-8v %s\n", n, kind, t.Enabled, detail)
+		fmt.Printf("%-16s %-10s %-8v %s\n", n, channel.NormalizeKind(t.Kind, n), t.Enabled, detail)
 	}
 	return nil
 }
@@ -377,11 +359,11 @@ func channelAdd(args []string) error {
 	if err := fs.Parse(args[2:]); err != nil {
 		return err
 	}
-	spec, ok := channel.Kinds()[kind]
+	k, ok := channel.Kinds()[kind]
 	if !ok {
 		return fmt.Errorf("unknown kind %q (%s)", args[0], strings.Join(channel.KindNames(), "|"))
 	}
-	if spec.RequiresToken && *tokenEnv == "" && *tokenVault == "" {
+	if k.Traits().RequiresToken && *tokenEnv == "" && *tokenVault == "" {
 		return fmt.Errorf("%s channels need a secret: pass --token-env NAME (or --token-vault)", kind)
 	}
 
@@ -392,15 +374,6 @@ func channelAdd(args []string) error {
 	if _, exists := cfg.Transports[name]; exists {
 		return fmt.Errorf("channel %q already exists (remove it first)", name)
 	}
-	// One group JID = ONE channel: a duplicate bind silently shadows the first (first
-	// match wins in stream routing), so refuse it here.
-	if *group != "" {
-		for existing, t := range cfg.Transports {
-			if t.Options["group"] == *group {
-				return fmt.Errorf("group %s is already bound to channel %q — one JID = one channel", *group, existing)
-			}
-		}
-	}
 	if *chatID != "" {
 		opts["chatId"] = *chatID
 	}
@@ -410,7 +383,7 @@ func channelAdd(args []string) error {
 	if len(opts) == 0 {
 		opts = nil
 	}
-	cfg.Transports[name] = config.Transport{
+	want := config.Transport{
 		Enabled:    !*disabled,
 		Kind:       kind,
 		Account:    *account,
@@ -418,6 +391,10 @@ func channelAdd(args []string) error {
 		TokenVault: *tokenVault,
 		Options:    opts,
 	}
+	if err := k.Validate(name, want, cfg.Transports); err != nil {
+		return err
+	}
+	cfg.Transports[name] = want
 	if err := saveConfig(path, cfg); err != nil {
 		return err
 	}
@@ -425,39 +402,10 @@ func channelAdd(args []string) error {
 	if *tokenEnv != "" {
 		fmt.Printf("  remember to export %s (value never printed)\n", *tokenEnv)
 	}
-	switch kind {
-	case "whatsapp":
-		// The device is GLOBAL — say whether pairing is even needed, and nudge toward
-		// a group binding when none was given.
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		st := channel.WhatsappDeviceStatus(ctx, waBinOf(cfg.Transports[name]))
-		switch {
-		case !st.Installed:
-			fmt.Println("  wacli not found on PATH — install it, then: messenger channel connect " + name)
-		case st.Authenticated:
-			fmt.Printf("  device already linked (%s) — no pairing needed\n", st.LinkedJID)
-		default:
-			fmt.Printf("  pair the device once (serves ALL whatsapp channels): messenger channel connect %s\n", name)
-		}
-		if *group == "" {
-			fmt.Println("  no --group set: this channel is the catch-all. bind a group with:")
-			fmt.Printf("    messenger channel connect %s     # lists your groups + their JIDs\n", name)
-		}
-	case "telegram":
-		fmt.Printf("  register the webhook: messenger channel connect %s --public-url https://<host>\n", name)
-	case "webhook":
-		p := opts["path"]
-		if p == "" {
-			p = "/webhook/" + name
-		}
-		fmt.Printf("  inbound path: %s (HMAC X-Hub-Signature-256 with $%s)\n", p, *tokenEnv)
+	for _, h := range k.AddHints(name, want) {
+		fmt.Println("  " + h)
 	}
 	return nil
-}
-
-func waBinOf(t config.Transport) string {
-	return t.Options["bin"] // "" lets the probe default to wacli
 }
 
 func channelRemove(args []string) error {
@@ -513,66 +461,11 @@ func channelConnect(args []string) error {
 	if !ok {
 		return fmt.Errorf("no channel named %q", name)
 	}
-	kind := channel.NormalizeKind(t.Kind, name)
-	switch kind {
-	case "whatsapp":
-		return connectWhatsapp(name, t)
-	case "telegram":
-		path := t.Options["path"]
-		if path == "" {
-			path = "/telegram/" + name
-		}
-		if *publicURL == "" {
-			fmt.Printf("telegram %q webhook path is %s\n", name, path)
-			fmt.Printf("re-run with --public-url https://<host> to print the setWebhook call\n")
-			return nil
-		}
-		fmt.Printf("set the webhook (run against your bot token, kept out of this output):\n")
-		fmt.Printf("  curl -sS \"https://api.telegram.org/bot$%s/setWebhook\" -d \"url=%s%s\"\n",
-			envNameOr(t.TokenEnv, "TELEGRAM_BOT_TOKEN"), strings.TrimRight(*publicURL, "/"), path)
-		return nil
-	case "webhook":
-		p := t.Options["path"]
-		if p == "" {
-			p = "/webhook/" + name
-		}
-		fmt.Printf("webhook %q needs no pairing. callers POST to %s signed with $%s:\n", name, p, envNameOr(t.TokenEnv, "MESSENGER_HOOK_SECRET"))
-		fmt.Printf("  sig=\"sha256=$(printf '%%s' \"$BODY\" | openssl dgst -sha256 -hmac \"$%s\" -hex | awk '{print $NF}')\"\n", envNameOr(t.TokenEnv, "MESSENGER_HOOK_SECRET"))
-		fmt.Printf("  curl -sS -X POST \"http://<host>%s\" -H \"X-Hub-Signature-256: $sig\" -d \"$BODY\"\n", p)
-		return nil
-	default:
-		fmt.Printf("channel %q (kind=%s) needs no connect step\n", name, kind)
-		return nil
+	k, err := channel.KindFor(name, t)
+	if err != nil {
+		return err
 	}
-}
-
-// connectWhatsapp is the wizard for the ONE global device: already linked → report +
-// list groups; not linked → run the interactive QR pair.
-func connectWhatsapp(name string, t config.Transport) error {
-	bin := t.Options["bin"]
-	if bin == "" {
-		bin = "wacli"
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	st := channel.WhatsappDeviceStatus(ctx, bin)
-	if !st.Installed {
-		return fmt.Errorf("wacli not found on PATH — install it first (https://wacli.sh)")
-	}
-	if st.Authenticated {
-		fmt.Printf("whatsapp device already linked (%s) — serves every whatsapp channel, no re-pair needed.\n", st.LinkedJID)
-		fmt.Println("known groups (bind one with: messenger channel add whatsapp <name> --group <jid>):")
-		cmd := exec.Command(bin, "groups", "list")
-		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-		if err := cmd.Run(); err != nil {
-			fmt.Println("  (could not list groups — run `wacli groups list` after a sync)")
-		}
-		return nil
-	}
-	fmt.Printf("pairing the global whatsapp device via %s auth — scan the QR (once per host):\n", bin)
-	cmd := exec.Command(bin, "auth")
-	cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
-	return cmd.Run()
+	return k.Connect(name, t, channel.ConnectParams{PublicURL: *publicURL, Existing: cfg.Transports})
 }
 
 // channelTest probes connectivity per kind WITHOUT sending a message: whatsapp = global
@@ -613,23 +506,19 @@ func channelTest(args []string) error {
 	failed := 0
 	for _, n := range sortedKeys(targets) {
 		t := targets[n]
-		spec, err := channel.SpecFor(n, t)
+		k, err := channel.KindFor(n, t)
 		if err != nil {
 			fmt.Printf("✗ %s: %v\n", n, err)
 			failed++
 			continue
 		}
-		if spec.Test == nil {
-			fmt.Printf("- %s (%s): nothing to test\n", n, spec.Name)
-			continue
-		}
-		lines, err := spec.Test(ctx, n, t, res)
+		lines, err := k.Test(ctx, n, t, res)
 		if err != nil {
-			fmt.Printf("✗ %s (%s): %v\n", n, spec.Name, err)
+			fmt.Printf("✗ %s (%s): %v\n", n, k.Name(), err)
 			failed++
 			continue
 		}
-		fmt.Printf("✓ %s (%s)\n", n, spec.Name)
+		fmt.Printf("✓ %s (%s)\n", n, k.Name())
 		for _, l := range lines {
 			fmt.Printf("    %s\n", l)
 		}
@@ -710,12 +599,15 @@ func envNameOr(name, fallback string) string {
 // existing identical channel, so boot scripts can run it every boot.
 func cmdRegister(args []string) error {
 	if len(args) < 1 || strings.HasPrefix(args[0], "-") {
-		return fmt.Errorf("usage: messenger register <agent> [--group <jid>] [--channels a,b] [--url URL] [--secret-env NAME]")
+		return fmt.Errorf("usage: messenger register <agent> [--group <jid> | --kind telegram|webhook --token-env NAME [--chat-id ID]] [--channels a,b] [--url URL] [--secret-env NAME]")
 	}
 	name := args[0]
 	fs := flag.NewFlagSet("register", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "config path")
+	kindFlag := fs.String("kind", "", "lane kind to create ("+strings.Join(channel.KindNames(), "|")+"); --group implies whatsapp")
 	group := fs.String("group", "", "whatsapp group JID — creates channel <agent> bound to it")
+	tokenEnv := fs.String("token-env", "", "env var NAME holding the lane's token/secret (telegram bot, webhook HMAC)")
+	chatID := fs.String("chat-id", "", "telegram: the lane's default target chat id")
 	channels := fs.String("channels", "", "existing channel names the agent listens to (default: its own)")
 	url := fs.String("url", "", "agent's push endpoint (omit = agent polls /inbox)")
 	secretEnv := fs.String("secret-env", "", "env var NAME that HMAC-signs pushes to the agent")
@@ -727,21 +619,30 @@ func cmdRegister(args []string) error {
 		return err
 	}
 
-	// Lane: --group creates (or accepts) the whatsapp channel named after the agent.
-	// One JID = ONE channel — a duplicate bind would silently shadow the first.
-	if *group != "" {
-		for existing, t := range cfg.Transports {
-			if existing != name && t.Options["group"] == *group {
-				return fmt.Errorf("group %s is already bound to channel %q — one JID = one channel (subscribe to it instead: --channels %s)", *group, existing, existing)
-			}
+	// Lane: the kind builds the agent's own channel polymorphically — whatsapp binds a
+	// group, telegram is its own bot, webhook its own signed path.
+	kind := channel.NormalizeKind(*kindFlag, *kindFlag)
+	if kind == "" && *group != "" {
+		kind = "whatsapp"
+	}
+	if kind != "" {
+		k, ok := channel.Kinds()[kind]
+		if !ok {
+			return fmt.Errorf("unknown kind %q (%s)", *kindFlag, strings.Join(channel.KindNames(), "|"))
 		}
-		if t, exists := cfg.Transports[name]; exists {
-			if t.Options["group"] != *group {
-				return fmt.Errorf("channel %q already exists with a different target — remove it first", name)
+		want, hints, err := k.Lane(name, channel.LaneParams{Group: *group, TokenEnv: *tokenEnv, ChatID: *chatID}, cfg.Transports)
+		if err != nil {
+			return err
+		}
+		if have, exists := cfg.Transports[name]; exists {
+			if !channel.LaneMatches(name, have, want) {
+				return fmt.Errorf("channel %q already exists with a different kind/target — remove it first", name)
 			}
 		} else {
-			cfg.Transports[name] = config.Transport{Enabled: true, Kind: "whatsapp", Options: map[string]string{"group": *group}}
-			fmt.Printf("channel %q → whatsapp group %s\n", name, *group)
+			cfg.Transports[name] = want
+			for _, h := range hints {
+				fmt.Println(h)
+			}
 		}
 	}
 

@@ -39,14 +39,20 @@ Channel and subscription **config changes** also belong to the host owner only.
 Onboarding a new agent is ONE idempotent command (safe to keep in boot.sh):
 
 ```sh
+# whatsapp lane (a group):
 messenger register <agent> --group <jid> --url http://127.0.0.1:<port>/hook
-# = channel <agent> bound to the group + subscription <agent> filtered to it
+# telegram lane (its own bot):
+messenger register <agent> --kind telegram --token-env BOT_TOKEN [--chat-id ID] --url …
+# webhook lane (its own signed path):
+messenger register <agent> --kind webhook --token-env HOOK_SECRET --url …
+# = channel <agent> of that kind + subscription <agent> filtered to it
 #   + prints the agent's exact send/reply/listen contract.
-# omit --url → poll mode; --channels a,b → attach to existing lanes instead of --group.
+# omit --url → poll mode; --channels a,b → attach to existing lanes instead of a new one.
 ```
 
 One group JID = ONE channel — `register`/`channel add` refuse a JID that is already
-bound (a duplicate bind would silently shadow the first).
+bound (a duplicate bind would silently shadow the first). `channel connect <wa>` lists
+only the FREE groups (bound ones hidden), so you never re-pick a taken JID.
 
 ## What EVERY agent must do (desk, worker, cron — no exceptions)
 

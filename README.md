@@ -45,7 +45,7 @@ messenger instead of double-starting — a second instance would split telegram 
 and spawn a competing whatsapp stream. Every install/agent talks to the one hub over HTTP.
 
 **Extensible:** a new kind (teams, slack, …) is one file implementing `channel.Channel`
-plus a `channel.Register(KindSpec{...})` — CLI, runtime, `/send`, subscriptions, and
+that embeds `channel.Base` + `channel.Register(...)` — CLI, runtime, `/send`, subscriptions, and
 threading work unchanged. See `docs/SPEC.md`.
 
 ## Channel kinds

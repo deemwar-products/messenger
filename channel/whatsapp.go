@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/deemwar-products/messenger/config"
 	"github.com/deemwar-products/messenger/envelope"
@@ -28,6 +29,176 @@ import (
 // maxAttachmentFetch caps how much of a remote attachment URL we pull to a temp file
 // before handing it to wacli (100 MB — beyond WhatsApp's own media ceiling anyway).
 const maxAttachmentFetch = 100 << 20
+
+// whatsappKind is the whole kind: wire behavior (Open + the ONE shared stream) and CLI
+// behavior (device wizardry, group rules) together.
+type whatsappKind struct{ Base }
+
+func init() { Register(whatsappKind{}) }
+
+func (whatsappKind) Name() string   { return "whatsapp" }
+func (whatsappKind) Traits() Traits { return Traits{TargetFlag: "group"} }
+
+func (whatsappKind) Open(name string, cfg config.Transport, res *SecretResolver) (Channel, error) {
+	return openWhatsapp(name, cfg, res)
+}
+
+func (whatsappKind) OpenStream(chans map[string]config.Transport, res *SecretResolver) (Streamer, error) {
+	return openWhatsappStream(chans, res)
+}
+
+func (whatsappKind) Test(ctx context.Context, name string, cfg config.Transport, res *SecretResolver) ([]string, error) {
+	return testWhatsapp(ctx, name, cfg, res)
+}
+
+// Validate: one group JID = ONE channel — a duplicate bind silently shadows the first
+// (first match wins in stream routing), so refuse it at add time.
+func (whatsappKind) Validate(name string, cfg config.Transport, existing map[string]config.Transport) error {
+	g := cfg.Options["group"]
+	if g == "" {
+		return nil
+	}
+	for other, t := range existing {
+		if other != name && t.Options["group"] == g {
+			return fmt.Errorf("group %s is already bound to channel %q — one JID = one channel", g, other)
+		}
+	}
+	return nil
+}
+
+// AddHints: the device is GLOBAL — say whether pairing is even needed, and nudge
+// toward a group binding when none was given.
+func (whatsappKind) AddHints(name string, cfg config.Transport) []string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var hints []string
+	st := WhatsappDeviceStatus(ctx, waBin(cfg))
+	switch {
+	case !st.Installed:
+		hints = append(hints, "wacli not found on PATH — install it, then: messenger channel connect "+name)
+	case st.Authenticated:
+		hints = append(hints, fmt.Sprintf("device already linked (%s) — no pairing needed", st.LinkedJID))
+	default:
+		hints = append(hints, fmt.Sprintf("pair the device once (serves ALL whatsapp channels): messenger channel connect %s", name))
+	}
+	if cfg.Options["group"] == "" {
+		hints = append(hints,
+			"no --group set: this channel is the catch-all. bind a group with:",
+			fmt.Sprintf("  messenger channel connect %s     # lists your FREE groups + their JIDs", name))
+	}
+	return hints
+}
+
+// Connect is the wizard for the ONE global device: already linked → report + list the
+// FREE groups (JIDs not yet bound to a channel); not linked → run the interactive QR
+// pair, once for all whatsapp channels.
+func (whatsappKind) Connect(name string, cfg config.Transport, p ConnectParams) error {
+	bin := waBin(cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	st := WhatsappDeviceStatus(ctx, bin)
+	if !st.Installed {
+		return fmt.Errorf("wacli not found on PATH — install it first (https://wacli.sh)")
+	}
+	if !st.Authenticated {
+		fmt.Printf("pairing the global whatsapp device via %s auth — scan the QR (once per host):\n", bin)
+		cmd := exec.Command(bin, "auth")
+		cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
+		return cmd.Run()
+	}
+	fmt.Printf("whatsapp device already linked (%s) — serves every whatsapp channel, no re-pair needed.\n", st.LinkedJID)
+	free, bound := freeGroups(ctx, bin, p.Existing)
+	switch {
+	case len(free) == 0 && bound == 0:
+		fmt.Println("no groups in the local store yet — run `wacli sync` once, then re-run connect.")
+	case len(free) == 0:
+		fmt.Printf("no free groups: all %d known group(s) are already bound to channels.\n", bound)
+	default:
+		fmt.Printf("free groups (%d already bound are hidden) — bind one with: messenger register <agent> --group <jid>\n", bound)
+		for _, g := range free {
+			fmt.Printf("  %-40s %s\n", g.Name, g.JID)
+		}
+	}
+	return nil
+}
+
+func (whatsappKind) Detail(name string, cfg config.Transport) string {
+	if g := cfg.Options["group"]; g != "" {
+		return "group=" + g
+	}
+	return "(catch-all: unmatched chats land here)"
+}
+
+// Lane: an agent's whatsapp lane is a channel bound to its group (or the catch-all
+// when no group is given).
+func (k whatsappKind) Lane(name string, p LaneParams, existing map[string]config.Transport) (config.Transport, []string, error) {
+	var opts map[string]string
+	if p.Group != "" {
+		opts = map[string]string{"group": p.Group}
+	}
+	want := config.Transport{Enabled: true, Kind: "whatsapp", Options: opts}
+	if err := k.Validate(name, want, existing); err != nil {
+		return config.Transport{}, nil, fmt.Errorf("%w (subscribe to the existing channel instead: --channels <its name>)", err)
+	}
+	hint := fmt.Sprintf("channel %q → whatsapp group %s", name, p.Group)
+	if p.Group == "" {
+		hint = fmt.Sprintf("channel %q → whatsapp catch-all (no --group)", name)
+	}
+	return want, []string{hint}, nil
+}
+
+// Status: the GLOBAL device state, shown by setup/status so the user knows whether
+// pairing is even needed.
+func (whatsappKind) Status() []string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	st := WhatsappDeviceStatus(ctx, "")
+	switch {
+	case !st.Installed:
+		return []string{"whatsapp: wacli not found on PATH — install it to use whatsapp channels"}
+	case st.Authenticated:
+		return []string{fmt.Sprintf("whatsapp: device already linked (%s) — no pairing needed, just add group channels", st.LinkedJID)}
+	default:
+		return []string{"whatsapp: wacli installed but not paired — `messenger channel connect <name>` will run the QR pair once"}
+	}
+}
+
+// waGroup is one group from the local wacli store.
+type waGroup struct {
+	JID  string `json:"jid"`
+	Name string `json:"name"`
+}
+
+// freeGroups lists the device's known groups MINUS the ones already bound to a channel,
+// plus how many were hidden — so the wizard only offers groups that can still be bound.
+func freeGroups(ctx context.Context, bin string, existing map[string]config.Transport) ([]waGroup, int) {
+	out, err := exec.CommandContext(ctx, bin, "--json", "groups", "list").Output()
+	if err != nil {
+		return nil, 0
+	}
+	var res struct {
+		Data []waGroup `json:"data"`
+	}
+	if json.Unmarshal(out, &res) != nil {
+		return nil, 0
+	}
+	taken := map[string]bool{}
+	for _, t := range existing {
+		if g := t.Options["group"]; g != "" {
+			taken[g] = true
+		}
+	}
+	var free []waGroup
+	bound := 0
+	for _, g := range res.Data {
+		if taken[g.JID] {
+			bound++
+			continue
+		}
+		free = append(free, g)
+	}
+	return free, bound
+}
 
 // runCmdFunc is the exec seam shared by the send and stream paths: it runs bin with
 // args and returns combined output, so tests fake wacli without a subprocess.

@@ -18,11 +18,11 @@ import (
 func TestWebhookInbound_SignedNormalizesWithThreadAndReply(t *testing.T) {
 	t.Setenv("HOOK_SECRET", "s3cr3t")
 	cfg := config.Transport{Kind: "hook", Account: "acct", TokenEnv: "HOOK_SECRET"}
-	spec, err := SpecFor("in", cfg)
-	if err != nil || spec.Name != "webhook" {
-		t.Fatalf("legacy kind hook should resolve to webhook: %v %v", spec.Name, err)
+	k, err := KindFor("in", cfg)
+	if err != nil || k.Name() != "webhook" {
+		t.Fatalf("legacy kind hook should resolve to webhook: %v %v", k, err)
 	}
-	ch, err := spec.Open("in", cfg, NewSecretResolver(nil))
+	ch, err := k.Open("in", cfg, NewSecretResolver(nil))
 	if err != nil {
 		t.Fatal(err)
 	}

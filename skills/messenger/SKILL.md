@@ -119,8 +119,9 @@ One-shot agent onboarding (lane + listen, idempotent — safe to re-run from boo
 
 ```sh
 messenger register cryptodesk --group 123456789@g.us --url http://127.0.0.1:9100/hook
-# creates whatsapp channel "cryptodesk" bound to the group (refuses a JID already bound
-# elsewhere), registers subscription "cryptodesk" filtered to it, prints the agent's
+# whatsapp lane. Also: --kind telegram --token-env BOT_TOKEN [--chat-id ID], or
+# --kind webhook --token-env HOOK_SECRET. Creates the channel (refuses a JID already
+# bound elsewhere), registers subscription "cryptodesk" filtered to it, prints the agent's
 # exact send/reply/listen contract. Omit --url → poll-mode instructions instead.
 ```
 

@@ -17,11 +17,11 @@ import (
 func TestInject_SignsPostsAndHandles401(t *testing.T) {
 	t.Setenv("HOOK_SECRET", "s3cr3t")
 	cfg := config.Transport{Kind: "webhook", TokenEnv: "HOOK_SECRET"}
-	spec, err := channel.SpecFor("in", cfg)
+	k, err := channel.KindFor("in", cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ch, err := spec.Open("in", cfg, channel.NewSecretResolver(nil))
+	ch, err := k.Open("in", cfg, channel.NewSecretResolver(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
