@@ -708,6 +708,15 @@ func probeRunning(addr string) bool {
 	return h.Service == "messenger"
 }
 
+// isAddrInUse reports whether err is the OS "address already in use" error — the signal
+// that another process won the TCP bind race started by probeRunning's TOCTOU window (two
+// `serve`/`listen` processes can both see probeRunning() == false if they start within the
+// same ~2s probe timeout, but only one wins the actual bind). Checked by unwrapping to the
+// syscall errno, never by string-matching the error text (which is not portable).
+func isAddrInUse(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE)
+}
+
 // baseURLFor turns a listen addr (":14310" or "host:port") into the loopback-default
 // base URL CLI verbs use to reach the running hub.
 func baseURLFor(addr string) string {
@@ -991,6 +1000,13 @@ func cmdListen(args []string) error {
 	go func() { <-ctx.Done(); _ = srv.Shutdown(context.Background()); rt.Down() }()
 	fmt.Printf("messenger listen on %s (channels: %v, subscriptions: %d)\n", *addr, sortedKeys(cfg.Enabled()), disp.Count())
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		// Lost the boot race against another `listen`/`serve` that also passed
+		// probeRunning: the OS bind is the real arbiter, so the loser reuses gracefully
+		// instead of surfacing a raw bind error.
+		if isAddrInUse(err) {
+			fmt.Printf("messenger already running on %s — reusing it; not starting a second ingress.\n", *addr)
+			return nil
+		}
 		return err
 	}
 	return nil
@@ -1214,6 +1230,14 @@ func cmdServe(args []string) error {
 	fmt.Printf("messenger serve on %s (channels: %v, subscriptions: %d, auth: %v)\n",
 		*addr, sortedKeys(cfg.Enabled()), disp.Count(), token != "")
 	if err := hs.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		// Lost the boot race against another `serve`/`listen` that also passed
+		// probeRunning: the OS bind is the real arbiter, so the loser reuses gracefully
+		// instead of surfacing a raw bind error.
+		if isAddrInUse(err) {
+			fmt.Printf("messenger already running on %s — reusing it (POST /send, GET /inbox there).\n", *addr)
+			fmt.Println("to run a second isolated instance, pass a different --addr and $MESSENGER_HOME.")
+			return nil
+		}
 		return err
 	}
 	return nil
