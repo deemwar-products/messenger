@@ -8,6 +8,7 @@ package server
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"mime"
 	"net/http"
 	"path/filepath"
@@ -75,6 +76,29 @@ func fileAttachment(file string) envelope.Attachment {
 	return a
 }
 
+// requireUnderMediaDir rejects any local attachment path that does not resolve inside
+// home.MediaDir() — the same directory GET /media already trusts, and exactly where
+// inbound attachments are stored (so forwarding a received attachment still works).
+// Without this, POST /send would let any caller who can reach the HTTP API read and
+// exfiltrate an arbitrary file on the host (e.g. {"file":"/etc/passwd"}).
+func requireUnderMediaDir(path string) error {
+	mediaDir, err := filepath.Abs(home.MediaDir())
+	if err != nil {
+		return err
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(mediaDir, abs)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return errAttachmentOutsideMediaDir
+	}
+	return nil
+}
+
+var errAttachmentOutsideMediaDir = errors.New("attachment path must be under the media directory — use an http(s) url for external files")
+
 func (s *Server) send(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -92,6 +116,15 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) {
 	if req.Channel == "" || (req.Text == "" && len(attachments) == 0) {
 		http.Error(w, "channel and text (or an attachment) are required", http.StatusBadRequest)
 		return
+	}
+	for _, a := range attachments {
+		if a.Path == "" || a.URL != "" {
+			continue
+		}
+		if err := requireUnderMediaDir(a.Path); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
 	// Conversation-first: reply_to "last" resolves to the newest inbound message on
 	// this channel (and thread, when given) and inherits its thread — "answer the

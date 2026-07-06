@@ -165,7 +165,12 @@ func TestSend_FileShorthandRidesAsAttachment(t *testing.T) {
 	srv := httptest.NewServer(New(rt, box, "tok").Handler())
 	defer srv.Close()
 
-	file := filepath.Join(t.TempDir(), "report.pdf")
+	// The attachment must live under the media dir — POST /send only trusts local
+	// paths inside home.MediaDir() (same boundary GET /media enforces).
+	if err := os.MkdirAll(home.MediaDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(home.MediaDir(), "report.pdf")
 	if err := os.WriteFile(file, []byte("pdf"), 0o600); err != nil {
 		t.Fatal(err)
 	}
