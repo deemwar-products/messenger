@@ -124,6 +124,176 @@ func TestTelegramInbound_DownloadFailureKeepsMetadataAttachment(t *testing.T) {
 	}
 }
 
+// inbound document success: the file downloads via getFile + the file endpoint into
+// $MESSENGER_HOME/media, the caption becomes the text, and Path/Size land on the
+// document attachment (metadata — name + mime — survives alongside the download).
+func TestTelegramInbound_DocumentDownloadsToMediaDir(t *testing.T) {
+	t.Setenv("MESSENGER_HOME", t.TempDir())
+	content := []byte("%PDF-1.4 report bytes")
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/bottok/getFile":
+			_ = r.ParseForm()
+			if r.PostForm.Get("file_id") != "doc-9" {
+				t.Errorf("getFile should ask for the document file_id, got %q", r.PostForm.Get("file_id"))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ok":true,"result":{"file_path":"documents/file_9.pdf"}}`))
+		case r.URL.Path == "/file/bottok/documents/file_9.pdf":
+			_, _ = w.Write(content)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	ch := newTelegram(t, ts.URL)
+	var got envelope.Envelope
+	h := ch.(Pushed).Handler(func(e envelope.Envelope) { got = e })
+
+	update := `{"message":{"message_id":77,"caption":"the report","chat":{"id":42},
+		"from":{"id":7,"username":"muthu"},
+		"document":{"file_id":"doc-9","file_name":"report.pdf","mime_type":"application/pdf","file_size":123}}}`
+	req := httptest.NewRequest(http.MethodPost, "/telegram/mybot", strings.NewReader(update))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", rec.Code)
+	}
+	if got.Text != "the report" {
+		t.Fatalf("caption should become text, got %q", got.Text)
+	}
+	if len(got.Attachments) != 1 {
+		t.Fatalf("want 1 attachment, got %d", len(got.Attachments))
+	}
+	att := got.Attachments[0]
+	if att.Type != "document" || att.Name != "report.pdf" || att.MIME != "application/pdf" {
+		t.Fatalf("document metadata should survive the download: %+v", att)
+	}
+	wantPath := filepath.Join(os.Getenv("MESSENGER_HOME"), "media", "77-report.pdf")
+	if att.Path != wantPath {
+		t.Fatalf("want path %q, got %q", wantPath, att.Path)
+	}
+	if att.Size != int64(len(content)) {
+		t.Fatalf("want size %d, got %d", len(content), att.Size)
+	}
+	onDisk, err := os.ReadFile(att.Path)
+	if err != nil || string(onDisk) != string(content) {
+		t.Fatalf("bad file on disk: %q err=%v", onDisk, err)
+	}
+}
+
+// outbound text-only: a plain envelope goes to sendMessage as a urlencoded form with
+// chat_id (the configured default) + text, threading via reply_to_message_id, and the
+// provider message_id is returned.
+func TestTelegramSend_TextOnlyForm(t *testing.T) {
+	var gotPath, gotCT string
+	var gotForm url.Values
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotCT = r.Header.Get("Content-Type")
+		_ = r.ParseForm()
+		gotForm = r.PostForm
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":321}}`))
+	}))
+	defer ts.Close()
+
+	ch := newTelegram(t, ts.URL)
+	env := envelope.Envelope{Channel: "mybot", Text: "hello there", ReplyTo: "20"}
+	id, err := ch.Send(context.Background(), env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/bottok/sendMessage" {
+		t.Fatalf("text should hit sendMessage, got %q", gotPath)
+	}
+	if gotCT != "application/x-www-form-urlencoded" {
+		t.Fatalf("text must be a plain form, got Content-Type %q", gotCT)
+	}
+	if gotForm.Get("chat_id") != "999" || gotForm.Get("text") != "hello there" {
+		t.Fatalf("bad form: %v", gotForm)
+	}
+	if gotForm.Get("reply_to_message_id") != "20" {
+		t.Fatalf("bad reply_to_message_id: %v", gotForm)
+	}
+	if id != "321" {
+		t.Fatalf("want provider id 321, got %q", id)
+	}
+}
+
+// outbound document Path: a document goes to sendDocument as a multipart upload with the
+// file in the "document" field, caption + chat_id, and the provider id is returned.
+func TestTelegramSend_DocumentPathUploadsMultipart(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "report.pdf")
+	if err := os.WriteFile(src, []byte("pdf-bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var gotPath, gotCT, gotFilename string
+	var gotForm url.Values
+	var gotFile []byte
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotCT = r.Header.Get("Content-Type")
+		if err := r.ParseMultipartForm(1 << 20); err == nil {
+			gotForm = r.MultipartForm.Value
+			if fhs := r.MultipartForm.File["document"]; len(fhs) == 1 {
+				gotFilename = fhs[0].Filename
+				f, _ := fhs[0].Open()
+				buf := make([]byte, fhs[0].Size)
+				_, _ = f.Read(buf)
+				_ = f.Close()
+				gotFile = buf
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":444}}`))
+	}))
+	defer ts.Close()
+
+	ch := newTelegram(t, ts.URL)
+	env := envelope.Envelope{Channel: "mybot", Text: "here is the doc",
+		Attachments: []envelope.Attachment{{Type: "document", Name: "report.pdf", Path: src}}}
+	id, err := ch.Send(context.Background(), env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/bottok/sendDocument" {
+		t.Fatalf("document should hit sendDocument, got %q", gotPath)
+	}
+	if !strings.HasPrefix(gotCT, "multipart/form-data") {
+		t.Fatalf("want multipart upload, got Content-Type %q", gotCT)
+	}
+	if got := gotForm["chat_id"]; len(got) != 1 || got[0] != "999" {
+		t.Fatalf("bad chat_id: %v", gotForm)
+	}
+	if got := gotForm["caption"]; len(got) != 1 || got[0] != "here is the doc" {
+		t.Fatalf("bad caption: %v", gotForm)
+	}
+	if gotFilename != "report.pdf" || string(gotFile) != "pdf-bytes" {
+		t.Fatalf("bad file part: name=%q body=%q", gotFilename, gotFile)
+	}
+	if id != "444" {
+		t.Fatalf("want provider id 444, got %q", id)
+	}
+}
+
+// no target: a send with neither ThreadID nor a configured chatId is a config error, not
+// a silent drop or a malformed Bot API call.
+func TestTelegramSend_NoTargetErrors(t *testing.T) {
+	t.Setenv("TG_TOKEN", "tok")
+	cfg := config.Transport{Kind: "telegram", TokenEnv: "TG_TOKEN",
+		Options: map[string]string{"baseURL": "http://127.0.0.1:0"}} // no chatId
+	ch, err := openTelegram("mybot", cfg, NewSecretResolver(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Send(context.Background(), envelope.Envelope{Text: "hi"}); err == nil {
+		t.Fatal("send with no target must error")
+	}
+}
+
 // outbound Path attachment: an image goes to sendPhoto as a multipart upload with
 // caption + chat_id, and the provider message_id is returned.
 func TestTelegramSend_PathAttachmentUploadsMultipart(t *testing.T) {
