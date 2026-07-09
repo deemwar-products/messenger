@@ -59,6 +59,11 @@ func (rt *Runtime) HTTPHandler() http.Handler { return rt.mux }
 // before Up.
 func (rt *Runtime) SetSelfURL(u string) { rt.selfURL = u }
 
+// Publish injects an envelope into the hub's inbound seam — the exact path every channel
+// publishes through (inbox append + subscription fan-out). It lets the HTTP surface (the
+// universal hook's POST /hook/send) inject a peer's message as if a channel had received it.
+func (rt *Runtime) Publish(env envelope.Envelope) { rt.pub(env) }
+
 // Channels returns name -> kind for everything opened (health/introspection).
 func (rt *Runtime) Channels() map[string]string {
 	rt.mu.Lock()
