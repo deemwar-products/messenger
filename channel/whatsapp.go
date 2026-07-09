@@ -674,9 +674,15 @@ func (s *whatsappStream) publishMessage(ctx context.Context, raw json.RawMessage
 	pub(env)
 }
 
-// downloadMedia shells `wacli media download` into home.MediaDir() and returns the
-// stored file's path, or "" on any failure (the caller publishes regardless). wacli
-// serializes device access itself, so running inline on the stream is fine.
+// downloadMedia shells `wacli --read-only media download` into home.MediaDir() and
+// returns the stored file's path, or "" on any failure (the caller publishes
+// regardless). --read-only (with an explicit --output) is required here: the hub's
+// long-lived `wacli sync --follow` subprocess (Run, above) holds wacli's store lock for
+// its entire lifetime, so a second, non-read-only `wacli media download` invocation
+// always fails with "store is locked" (it tries to write local_path/downloaded_at back
+// into wacli.db). --read-only fetches the media over the WhatsApp connection without
+// touching the store at all, sidestepping the lock entirely — verified against a live
+// wacli 0.11.1 store with sync --follow running.
 func (s *whatsappStream) downloadMedia(ctx context.Context, chat, id string) string {
 	if chat == "" || id == "" {
 		return ""
@@ -685,7 +691,7 @@ func (s *whatsappStream) downloadMedia(ctx context.Context, chat, id string) str
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return ""
 	}
-	out, err := s.runCmd(ctx, s.bin, "media", "download", "--chat", chat, "--id", id, "--output", dir, "--json")
+	out, err := s.runCmd(ctx, s.bin, "--read-only", "media", "download", "--chat", chat, "--id", id, "--output", dir, "--json")
 	if err != nil {
 		return ""
 	}
