@@ -18,6 +18,11 @@ type Config struct {
 	// ServeTokenEnv names the env var holding the bearer token `messenger serve` requires
 	// on POST /send. Empty = no auth (loopback-only dev).
 	ServeTokenEnv string `toml:"serveTokenEnv,omitempty"`
+	// HookSecretEnv names the env var holding the shared secret for the universal hook
+	// (POST /hook/send + POST /hook/recv), HMAC-signed as X-Hub-Signature-256. Empty
+	// defaults to MESSENGER_HOOK_SECRET; when that env var is itself unset the two /hook/*
+	// endpoints refuse (503) — a peer can only reach the hub once the owner sets the secret.
+	HookSecretEnv string `toml:"hookSecretEnv,omitempty"`
 	// Transports maps a channel name (also the Envelope Channel) to its connection config.
 	Transports map[string]Transport `toml:"transports,omitempty"`
 	// Subscriptions maps a consumer name to its durable push subscription.

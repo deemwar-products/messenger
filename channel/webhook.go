@@ -174,6 +174,13 @@ func VerifyHMAC(secret, body []byte, sig string) bool {
 	return hmac.Equal([]byte(SignHMAC(secret, body)), []byte(sig))
 }
 
+// NormalizeWebhook exposes normalizeWebhook to the HTTP surface: the universal hook
+// (POST /hook/send) reuses the same lenient payload shape so a signed peer injects a
+// message identically whether it hits a per-lane /webhook/<name> or the global /hook/send.
+func NormalizeWebhook(name, account string, body []byte) envelope.Envelope {
+	return normalizeWebhook(name, account, body)
+}
+
 // normalizeWebhook turns a verified payload into the canonical inbound Envelope. It
 // reads a best-effort {text|message, sender|login, thread_id, reply_to, id, attachments}
 // shape and falls back to the raw body as text, so any signed caller can inject a

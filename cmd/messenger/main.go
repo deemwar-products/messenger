@@ -1209,6 +1209,7 @@ func cmdServe(args []string) error {
 		token = os.Getenv(cfg.ServeTokenEnv)
 	}
 	srv := server.New(rt, box, token)
+	srv.UseHookSecret(cfg.HookSecretEnv)
 	hs := &http.Server{Addr: *addr, Handler: srv.Handler()}
 	go func() { <-ctx.Done(); _ = hs.Shutdown(context.Background()); rt.Down() }()
 	fmt.Printf("messenger serve on %s (channels: %v, subscriptions: %d, auth: %v)\n",
