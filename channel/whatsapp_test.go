@@ -484,3 +484,96 @@ func TestHelperProcess(t *testing.T) {
 	fmt.Printf(`{"event":"error","data":{"message":"store is locked (another wacli is running?): resource temporarily unavailable (pid=%s\nacquired_at=x)"},"ts":1}`+"\n", os.Getenv("HELPER_LOCK_PID"))
 	os.Exit(1)
 }
+
+// --- live wacli --webhook shape: media is a NESTED object, not a flat media_type ---
+
+// TestWhatsappStream_NestedMediaWebhookDownloads reproduces the EXACT shape wacli's
+// `sync --follow --webhook` posts for a voice note (top-level PascalCase Chat/ID/Text and
+// a nested "Media" object — matched case-insensitively by encoding/json). The old parser
+// only looked for a flat media_type, so it created no attachment and never downloaded;
+// the message landed as "[Audio]" with attachments=null. Now the nested Media triggers
+// downloadMedia and populates attachments[0].path.
+func TestWhatsappStream_NestedMediaWebhookDownloads(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MESSENGER_HOME", dir)
+	stored := filepath.Join(dir, "message-XYZ.oga")
+	if err := os.WriteFile(stored, []byte("oggopusbytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	chans := map[string]config.Transport{"muthu": {Kind: "whatsapp", Options: map[string]string{"group": "120363408634625681@g.us"}}}
+	st, err := openWhatsappStream(chans, NewSecretResolver(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := st.(*whatsappStream)
+	fake := &fakeRunCmd{out: []byte(`{"success":true,"data":{"path":"` + stored + `"},"error":null}`)}
+	s.runCmd = fake.run
+
+	// The real top-level webhook shape, with a nested Media object for a voice note.
+	line := `{"Chat":"120363408634625681@g.us","ID":"ACE201EDC9DB4914676B115A0F5A6186","SenderJID":"181127444713663@lid","FromMe":false,"Text":"[Audio]","Media":{"kind":"audio","mimetype":"audio/ogg; codecs=opus","name":"note.oga"},"PushName":"Muthu"}`
+	var got []envelope.Envelope
+	s.ingest(context.Background(), []byte(line), func(e envelope.Envelope) { got = append(got, e) })
+
+	if len(got) != 1 {
+		t.Fatalf("want 1 envelope, got %d", len(got))
+	}
+	a := got[0].Attachments
+	if len(a) != 1 {
+		t.Fatalf("nested Media must yield 1 attachment, got %d (bug: flat-only parse)", len(a))
+	}
+	if a[0].Type != "audio" || a[0].Path != stored || a[0].MIME != "audio/ogg; codecs=opus" {
+		t.Fatalf("bad attachment from nested Media: %+v", a[0])
+	}
+	if a[0].Size != int64(len("oggopusbytes")) {
+		t.Fatalf("attachment size not stat'd: %+v", a[0])
+	}
+	if len(fake.calls) != 1 || !argsHavePair(fake.calls[0], "--chat", "120363408634625681@g.us") ||
+		!argsHavePair(fake.calls[0], "--id", "ACE201EDC9DB4914676B115A0F5A6186") {
+		t.Fatalf("downloadMedia not invoked with chat+id: %v", fake.calls)
+	}
+}
+
+// TestWhatsappStream_OpaqueMediaStillDownloads: even if wacli's Media inner shape is one
+// we don't recognize, a non-null Media object must still be treated as an attachment
+// (type "file") and downloaded by id — a voice note is never silently dropped to text.
+func TestWhatsappStream_OpaqueMediaStillDownloads(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MESSENGER_HOME", dir)
+	stored := filepath.Join(dir, "blob.bin")
+	_ = os.WriteFile(stored, []byte("x"), 0o600)
+	chans := map[string]config.Transport{"g": {Kind: "whatsapp", Options: map[string]string{"group": "1@g.us"}}}
+	st, _ := openWhatsappStream(chans, NewSecretResolver(nil))
+	s := st.(*whatsappStream)
+	fake := &fakeRunCmd{out: []byte(`{"success":true,"data":{"path":"` + stored + `"}}`)}
+	s.runCmd = fake.run
+
+	line := `{"chat":"1@g.us","id":"OP1","sender":"x","Media":{"some":"future","shape":123}}`
+	var got []envelope.Envelope
+	s.ingest(context.Background(), []byte(line), func(e envelope.Envelope) { got = append(got, e) })
+	if len(got) != 1 || len(got[0].Attachments) != 1 {
+		t.Fatalf("opaque Media must still attach+publish, got %+v", got)
+	}
+	if got[0].Attachments[0].Type != "file" || got[0].Attachments[0].Path != stored {
+		t.Fatalf("opaque Media should download as file: %+v", got[0].Attachments[0])
+	}
+}
+
+// TestWhatsappStream_NullMediaIsTextOnly: a plain text message (Media:null) must NOT
+// become an attachment.
+func TestWhatsappStream_NullMediaIsTextOnly(t *testing.T) {
+	t.Setenv("MESSENGER_HOME", t.TempDir())
+	chans := map[string]config.Transport{"g": {Kind: "whatsapp", Options: map[string]string{"group": "1@g.us"}}}
+	st, _ := openWhatsappStream(chans, NewSecretResolver(nil))
+	s := st.(*whatsappStream)
+	fake := &fakeRunCmd{out: []byte(`{}`)}
+	s.runCmd = fake.run
+	line := `{"Chat":"1@g.us","ID":"T1","SenderJID":"x","Text":"hello","Media":null}`
+	var got []envelope.Envelope
+	s.ingest(context.Background(), []byte(line), func(e envelope.Envelope) { got = append(got, e) })
+	if len(got) != 1 || len(got[0].Attachments) != 0 {
+		t.Fatalf("text with Media:null must have no attachment: %+v", got)
+	}
+	if len(fake.calls) != 0 {
+		t.Fatalf("must not attempt a download for a text message: %v", fake.calls)
+	}
+}

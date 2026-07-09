@@ -520,6 +520,44 @@ type waMessage struct {
 	FilenamePC  string `json:"Filename"`
 	MIMELC      string `json:"mime"`
 	MIMEPC      string `json:"MimeType"`
+
+	// Media is the LIVE wacli sync --webhook shape: media metadata is NOT a flat
+	// media_type on the message, it is a nested object (`"Media":{...}` — null for a
+	// plain text message). The flat fields above are the store/compact spellings; this
+	// covers the webhook that actually feeds the hub. Kept as raw JSON so a null or an
+	// unexpected inner shape never breaks parsing.
+	Media json.RawMessage `json:"media"`
+}
+
+// waMedia is the nested Media object wacli posts over the webhook for an attachment.
+// Field spellings are matched case-insensitively by encoding/json, so "MimeType",
+// "mimetype" and "Mimetype" all land here.
+type waMedia struct {
+	Kind      string `json:"kind"`
+	Type      string `json:"type"`
+	MediaType string `json:"mediatype"`
+	Mimetype  string `json:"mimetype"`
+	Mime      string `json:"mime"`
+	Name      string `json:"name"`
+	File      string `json:"file"`
+	Filename  string `json:"filename"`
+	Caption   string `json:"caption"`
+}
+
+// media returns the parsed nested Media object and whether the message carries one. A
+// missing, null, or unparseable Media is (nil,false) — the message is treated as
+// text-only.
+func (m waMessage) media() (*waMedia, bool) {
+	trimmed := bytes.TrimSpace(m.Media)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, false
+	}
+	var md waMedia
+	if json.Unmarshal(trimmed, &md) != nil {
+		// Present but not the object shape we know — still an attachment; download by id.
+		return &waMedia{}, true
+	}
+	return &md, true
 }
 
 func (m waMessage) id() string {
@@ -539,10 +577,49 @@ func firstNonEmpty(a, b string) string {
 	return b
 }
 
-func (m waMessage) mediaType() string { return firstNonEmpty(m.MediaTypeLC, m.MediaTypePC) }
-func (m waMessage) caption() string   { return firstNonEmpty(m.CaptionLC, m.CaptionPC) }
-func (m waMessage) filename() string  { return firstNonEmpty(m.FilenameLC, m.FilenamePC) }
-func (m waMessage) mime() string      { return firstNonEmpty(m.MIMELC, m.MIMEPC) }
+// mediaType reports the attachment type. It prefers the flat store/compact fields, then
+// the nested webhook Media object. A message that carries a Media object but no
+// recognizable type string still reports "file" so it is ALWAYS treated as an
+// attachment (and downloaded) — a voice note must never be dropped to text-only.
+func (m waMessage) mediaType() string {
+	if t := firstNonEmpty(m.MediaTypeLC, m.MediaTypePC); t != "" {
+		return t
+	}
+	if md, ok := m.media(); ok {
+		if t := firstNonEmpty(firstNonEmpty(md.Kind, md.Type), md.MediaType); t != "" {
+			return t
+		}
+		return "file" // has an attachment, type unknown — never drop it
+	}
+	return ""
+}
+func (m waMessage) caption() string {
+	if c := firstNonEmpty(m.CaptionLC, m.CaptionPC); c != "" {
+		return c
+	}
+	if md, ok := m.media(); ok {
+		return md.Caption
+	}
+	return ""
+}
+func (m waMessage) filename() string {
+	if f := firstNonEmpty(m.FilenameLC, m.FilenamePC); f != "" {
+		return f
+	}
+	if md, ok := m.media(); ok {
+		return firstNonEmpty(md.Name, md.File)
+	}
+	return ""
+}
+func (m waMessage) mime() string {
+	if mm := firstNonEmpty(m.MIMELC, m.MIMEPC); mm != "" {
+		return mm
+	}
+	if md, ok := m.media(); ok {
+		return firstNonEmpty(md.Mimetype, md.Mime)
+	}
+	return ""
+}
 
 // attachmentType maps wacli's media type names onto envelope.Attachment.Type
 // (image | video | audio | voice | document | file). ptt is WhatsApp's push-to-talk
