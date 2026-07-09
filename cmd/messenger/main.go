@@ -359,6 +359,8 @@ func channelAdd(args []string) error {
 	tokenVault := fs.String("token-vault", "", "age vault entry NAME holding the token")
 	account := fs.String("account", "", "platform account/workspace label")
 	chatID := fs.String("chat-id", "", "telegram: default target chat/channel id")
+	userEnv := fs.String("user-env", "", "env var NAME holding the user/app identity (teams: the App ID)")
+	conversation := fs.String("conversation", "", "teams: default target conversation id")
 	group := fs.String("group", "", "whatsapp: the group JID this channel is bound to")
 	disabled := fs.Bool("disabled", false, "add the channel disabled")
 	opts := optionFlags{}
@@ -384,6 +386,9 @@ func channelAdd(args []string) error {
 	if *chatID != "" {
 		opts["chatId"] = *chatID
 	}
+	if *conversation != "" {
+		opts["conversationId"] = *conversation
+	}
 	if *group != "" {
 		opts["group"] = *group
 	}
@@ -396,6 +401,7 @@ func channelAdd(args []string) error {
 		Account:    *account,
 		TokenEnv:   *tokenEnv,
 		TokenVault: *tokenVault,
+		UserEnv:    *userEnv,
 		Options:    opts,
 	}
 	if err := k.Validate(name, want, cfg.Transports); err != nil {
