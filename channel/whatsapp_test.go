@@ -168,6 +168,46 @@ func TestWhatsappSend_AttachmentUsesSendFile(t *testing.T) {
 	}
 }
 
+// a "voice" attachment adds --ptt so wacli renders it as a WhatsApp voice-note bubble
+// instead of a generic file attachment; other attachment types must NOT get --ptt.
+func TestWhatsappSend_VoiceAttachmentUsesPTT(t *testing.T) {
+	fake := &fakeRunCmd{out: []byte(`{"success":true,"data":{"id":"WAMID3"},"error":null}`)}
+	ch := &whatsappChannel{
+		name:   "ops",
+		cfg:    config.Transport{Kind: "whatsapp", Options: map[string]string{"group": "111@g.us"}},
+		runCmd: fake.run,
+	}
+	env := envelope.Envelope{
+		Channel: "ops",
+		Attachments: []envelope.Attachment{
+			{Type: "voice", MIME: "audio/ogg", Path: "/tmp/reply.ogg"},
+		},
+	}
+	if _, err := ch.Send(context.Background(), env); err != nil {
+		t.Fatal(err)
+	}
+	if !argsContain(fake.calls[0], "--ptt") {
+		t.Fatalf("want --ptt for a voice attachment, got %v", fake.calls[0])
+	}
+
+	fake2 := &fakeRunCmd{out: []byte(`{"success":true,"data":{"id":"WAMID4"},"error":null}`)}
+	ch2 := &whatsappChannel{
+		name:   "ops",
+		cfg:    config.Transport{Kind: "whatsapp", Options: map[string]string{"group": "111@g.us"}},
+		runCmd: fake2.run,
+	}
+	env2 := envelope.Envelope{
+		Channel:     "ops",
+		Attachments: []envelope.Attachment{{Type: "audio", Path: "/tmp/song.mp3"}},
+	}
+	if _, err := ch2.Send(context.Background(), env2); err != nil {
+		t.Fatal(err)
+	}
+	if argsContain(fake2.calls[0], "--ptt") {
+		t.Fatalf("non-voice attachment must NOT get --ptt: %v", fake2.calls[0])
+	}
+}
+
 // env.Text rides as the caption on the FIRST attachment only.
 func TestWhatsappSend_CaptionOnFirstAttachmentOnly(t *testing.T) {
 	fake := &fakeRunCmd{out: []byte(`{"success":true,"data":{"id":"WAMID1"},"error":null}`)}
