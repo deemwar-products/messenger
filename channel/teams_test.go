@@ -202,12 +202,90 @@ func TestTeamsSendOutboundActivityJSON(t *testing.T) {
 	}
 }
 
+// clearTeamsServiceURLs resets the process-global serviceUrl registry so tests that assert
+// the "cold" (no serviceUrl learned yet) path are deterministic regardless of test order.
+func clearTeamsServiceURLs() {
+	teamsServiceURLs.Range(func(k, _ any) bool { teamsServiceURLs.Delete(k); return true })
+}
+
 func TestTeamsSendNoServiceURL(t *testing.T) {
+	clearTeamsServiceURLs()
 	res := NewSecretResolver(nil)
 	ch, _ := openTeams("t", teamsTestCfg(map[string]string{"conversationId": "19:x"}), res)
 	_, err := ch.Send(context.Background(), envelope.Envelope{Channel: "t", Text: "hi"})
 	if err == nil || !strings.Contains(err.Error(), "serviceUrl") {
 		t.Fatalf("want serviceUrl error, got %v", err)
+	}
+}
+
+func TestTeamsResolveServiceURLFallback(t *testing.T) {
+	clearTeamsServiceURLs()
+	res := NewSecretResolver(nil)
+	ch, _ := openTeams("t", teamsTestCfg(nil), res)
+	tc := ch.(*teamsChannel)
+	if got := tc.resolveServiceURL("19:brand-new@thread"); got != "" {
+		t.Fatalf("cold resolve should be empty, got %q", got)
+	}
+	// A learned last-seen serviceUrl (regional) is the fallback for a freshly created channel.
+	teamsServiceURLs.Store("", "https://smba.regional/")
+	if got := tc.resolveServiceURL("19:brand-new@thread"); got != "https://smba.regional/" {
+		t.Fatalf("want last-seen fallback, got %q", got)
+	}
+	clearTeamsServiceURLs()
+}
+
+func TestTeamsCreateChannel(t *testing.T) {
+	t.Setenv("TEAMS_TEST_SECRET", "shhh-not-real")
+	t.Setenv("TEAMS_TEST_APPID", "app-id-123")
+
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		f, _ := url.ParseQuery(string(b))
+		if f.Get("scope") != "https://graph.microsoft.com/.default" {
+			t.Errorf("graph scope = %q", f.Get("scope"))
+		}
+		io.WriteString(w, `{"access_token":"GRAPH-TOKEN","expires_in":3600}`)
+	}))
+	defer tokenSrv.Close()
+
+	var gotAuth, gotPath string
+	var gotBody map[string]string
+	graphSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotPath = r.URL.Path
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusCreated)
+		io.WriteString(w, `{"id":"19:newchan@thread.tacv2","displayName":"eng"}`)
+	}))
+	defer graphSrv.Close()
+
+	cfg := teamsTestCfg(map[string]string{
+		"tenantId":     "tid-1",
+		"loginURL":     tokenSrv.URL,
+		"graphBaseURL": graphSrv.URL,
+	})
+	convID, err := CreateTeamsChannel(context.Background(), cfg, NewSecretResolver(nil), "team-42", "eng", "the eng channel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if convID != "19:newchan@thread.tacv2" {
+		t.Fatalf("convID = %q", convID)
+	}
+	if gotAuth != "Bearer GRAPH-TOKEN" {
+		t.Fatalf("auth = %q", gotAuth)
+	}
+	if gotPath != "/teams/team-42/channels" {
+		t.Fatalf("path = %q", gotPath)
+	}
+	if gotBody["displayName"] != "eng" || gotBody["membershipType"] != "standard" {
+		t.Fatalf("body = %+v", gotBody)
+	}
+}
+
+func TestTeamsCreateChannelNeedsTenant(t *testing.T) {
+	_, err := CreateTeamsChannel(context.Background(), teamsTestCfg(nil), NewSecretResolver(nil), "team-1", "x", "")
+	if err == nil || !strings.Contains(err.Error(), "tenantId") {
+		t.Fatalf("want tenantId error, got %v", err)
 	}
 }
 

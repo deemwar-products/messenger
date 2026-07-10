@@ -78,6 +78,33 @@ Now inbound from that conversation arrives as `channel=eng`; everything else fal
 no manual serviceUrl. All teams channels MUST share the same `--token-env`/`--user-env`/
 `tenantId` (one bot per host); the hub rejects a mismatch and duplicate conversation binds.
 
+## Bot reads all messages + creates channels (RSC)
+
+The app manifest (`teams-app/manifest.json`) declares two **resource-specific consent**
+permissions — the **team owner** consents once at install (no tenant admin, not metered):
+
+- `ChannelMessage.Read.Group` — the bot receives **every** message in its channels, no
+  @mention needed. (Messages still arrive over Bot Framework — RSC just drops the mention
+  requirement; no Graph call to receive.)
+- `Channel.Create.Group` — the bot can **create** channels via Graph.
+
+**Create a channel — the bot then already knows its conversation id** (Graph returns it):
+
+```sh
+# borrows bot creds from an existing teams channel; creates via Graph POST /teams/{id}/channels
+messenger channel teams-create --team <teamId> --name "eng" --as eng
+#   conversationId: 19:...@thread.tacv2
+#   bound channel "eng" -> that conversation (saved)
+messenger send --channel eng --text "channel is live"
+```
+
+No @mention, no discovery — because the bot created the channel, it has the id. Creating
+uses an **app-only Graph token** (the same App ID+secret) and needs `options.tenantId`
+(single-tenant). Discovery of *existing* channels: add the bot to a team and it receives
+the install `conversationUpdate` (carries the conversation id + serviceUrl) — the catch-all
+channel surfaces it. **Re-sideload the updated package** (with RSC) and have the team owner
+consent for read-all/create to take effect.
+
 ## Verify
 
 ```sh

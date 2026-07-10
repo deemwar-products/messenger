@@ -190,7 +190,17 @@ func (c *teamsChannel) resolveServiceURL(convID string) string {
 			return s
 		}
 	}
-	return c.cfg.Options["serviceUrl"]
+	if s := c.cfg.Options["serviceUrl"]; s != "" {
+		return s
+	}
+	// Last-seen serviceUrl for this bot (regional, stable across a tenant) — lets a
+	// proactive send to a freshly CREATED channel work before it has any inbound of its own.
+	if v, ok := teamsServiceURLs.Load(""); ok {
+		if s, _ := v.(string); s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 // loginURL is the AAD token endpoint. options["loginURL"] lets tests point it at a
@@ -271,6 +281,106 @@ func (c *teamsChannel) aadToken(ctx context.Context) (string, error) {
 	c.tokenExp = time.Now().Add(ttl - time.Minute) // refresh a minute early
 	c.mu.Unlock()
 	return out.AccessToken, nil
+}
+
+// graphToken mints an app-only Microsoft Graph token (client-credentials) for RSC
+// management ops like creating a channel. RSC is tenant-scoped, so it needs a
+// single-tenant app (options.tenantId — the loginURL then targets that tenant). App ID +
+// secret are resolved by NAME and used only in the form body; not cached (rare op).
+func (c *teamsChannel) graphToken(ctx context.Context) (string, error) {
+	if c.cfg.Options["tenantId"] == "" && c.cfg.Options["loginURL"] == "" {
+		return "", fmt.Errorf("channel: teams graph: needs options.tenantId (single-tenant app for RSC)")
+	}
+	appID, err := c.res.User(c.cfg)
+	if err != nil {
+		return "", err
+	}
+	secret, err := c.res.Token(c.cfg)
+	if err != nil {
+		return "", err
+	}
+	form := url.Values{
+		"grant_type":    {"client_credentials"},
+		"client_id":     {appID},
+		"client_secret": {secret},
+		"scope":         {"https://graph.microsoft.com/.default"},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.loginURL(), strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("channel: teams graph token: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode/100 != 2 {
+		return "", fmt.Errorf("channel: teams graph token: status %d", resp.StatusCode)
+	}
+	var out struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil || out.AccessToken == "" {
+		return "", fmt.Errorf("channel: teams graph token: bad response")
+	}
+	return out.AccessToken, nil
+}
+
+// CreateChannel creates a standard channel in teamID via Microsoft Graph
+// (POST /teams/{teamId}/channels) using the RSC application permission Channel.Create.Group,
+// and returns the new channel's id — which IS the Bot Framework conversationId, so the bot
+// immediately knows where to send. Requires the app to be installed in the team with that
+// RSC permission consented (team owner, at install). options["graphBaseURL"] overrides the
+// Graph base (tests).
+func (c *teamsChannel) CreateChannel(ctx context.Context, teamID, displayName, description string) (string, error) {
+	tok, err := c.graphToken(ctx)
+	if err != nil {
+		return "", err
+	}
+	payload, _ := json.Marshal(map[string]string{
+		"displayName":    displayName,
+		"description":    description,
+		"membershipType": "standard",
+	})
+	base := c.cfg.Options["graphBaseURL"]
+	if base == "" {
+		base = "https://graph.microsoft.com/v1.0"
+	}
+	endpoint := strings.TrimRight(base, "/") + "/teams/" + url.PathEscape(teamID) + "/channels"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(payload)))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("channel: teams create channel: %w", err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode/100 != 2 {
+		return "", fmt.Errorf("channel: teams create channel: status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var out struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(b, &out); err != nil || out.ID == "" {
+		return "", fmt.Errorf("channel: teams create channel: no id in response")
+	}
+	return out.ID, nil
+}
+
+// CreateTeamsChannel is the exported entry point (for the CLI): it opens a teams handle
+// from cfg and creates a channel in teamID, returning the new conversationId (Graph id).
+func CreateTeamsChannel(ctx context.Context, cfg config.Transport, res *SecretResolver, teamID, displayName, description string) (string, error) {
+	ch, err := openTeams("teams", cfg, res)
+	if err != nil {
+		return "", err
+	}
+	return ch.(*teamsChannel).CreateChannel(ctx, teamID, displayName, description)
 }
 
 // teamsActivity is the slice of a Bot Framework Activity we read (inbound) or write
@@ -431,8 +541,11 @@ func (s *teamsStream) Handler(pub Publisher) http.Handler {
 			convID = act.Conversation.ID
 		}
 		// Record the per-conversation serviceUrl so a later proactive Send can reach it.
-		if act.ServiceURL != "" && convID != "" {
-			teamsServiceURLs.Store(convID, act.ServiceURL)
+		if act.ServiceURL != "" {
+			if convID != "" {
+				teamsServiceURLs.Store(convID, act.ServiceURL)
+			}
+			teamsServiceURLs.Store("", act.ServiceURL) // last-seen (regional) fallback
 		}
 		// Only message activities carry user text/media; ack everything else (typing,
 		// conversationUpdate, …) without publishing.

@@ -30,6 +30,18 @@
       "isNotificationOnly": false
     }
   ],
-  "permissions": ["identity", "messageTeamMembers"],
-  "validDomains": ["FILL: your-public-host-no-scheme.example.com"]
+  "validDomains": ["FILL: your-public-host-no-scheme.example.com"],
+  "webApplicationInfo": {
+    "id": "FILL: TEAMS_BOT_APP_ID (the Azure Bot Microsoft App ID)",
+    "resource": "api://FILL: your-public-host-no-scheme.example.com/FILL: TEAMS_BOT_APP_ID"
+  },
+  "authorization": {
+    "permissions": {
+      "orgWide": [],
+      "resourceSpecific": [
+        { "name": "ChannelMessage.Read.Group", "type": "Application" },
+        { "name": "Channel.Create.Group", "type": "Application" }
+      ]
+    }
+  }
 }
