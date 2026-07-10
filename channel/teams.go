@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -23,16 +24,19 @@ import (
 	"github.com/deemwar-products/messenger/home"
 )
 
-// teamsKind is the whole Microsoft Teams **bot** kind: wire behavior + CLI behavior.
-// Like telegram it is a bot — an Azure Bot Framework app identified by an App (client)
-// ID + client secret — that RECEIVES inbound over an HTTP webhook (Bot Framework
-// Activity JSON POSTed to /webhook/teams) and SENDS outbound over the Bot Connector
-// REST API. It is NOT the incoming-webhook connector (that cannot do attachments).
+// teamsKind is the whole Microsoft Teams **bot** kind, modelled exactly like whatsapp:
+// the host has ONE bot (an Azure Bot Framework app identified by an App (client) ID +
+// client secret) and every configured teams channel is a named Teams CONVERSATION on
+// that one bot. Exactly ONE shared inbound webhook (/webhook/teams) serves every teams
+// channel no matter how many exist; inbound is routed to the channel whose
+// options["conversationId"] matches the Activity's conversation.id. A conversation-less
+// teams channel is the CATCH-ALL (receives every conversation not bound elsewhere — the
+// way you discover conversation ids to then bind). Sends go out over the Bot Connector
+// REST API. It is NOT the incoming-webhook connector (that cannot do attachments), and
+// it uses NO Graph API — the bot itself sends and receives everything.
 //
-// One teams channel = one bot bound to one Teams conversation (a channel/chat). Because
-// a bot has ONE messaging endpoint, a second teams channel overrides options["path"].
-// serviceUrl is per-activity and per-tenant; we persist the last-seen one in memory so
-// a proactive Send works between inbound messages.
+// serviceUrl is per-conversation (learned from inbound); the shared stream records it in
+// teamsServiceURLs so any channel's proactive Send can reach that conversation.
 type teamsKind struct{ Base }
 
 func init() { Register(teamsKind{}) }
@@ -42,6 +46,39 @@ func (teamsKind) Traits() Traits { return Traits{RequiresToken: true, TargetFlag
 
 func (teamsKind) Open(name string, cfg config.Transport, res *SecretResolver) (Channel, error) {
 	return openTeams(name, cfg, res)
+}
+
+// OpenStream builds the ONE shared inbound webhook over all teams channels (mirrors
+// whatsapp's single stream): it verifies the Bot Connector JWT once and routes each
+// Activity to the bound channel by conversation.id.
+func (teamsKind) OpenStream(chans map[string]config.Transport, res *SecretResolver) (Streamer, error) {
+	return openTeamsStream(chans, res)
+}
+
+// Validate enforces the one-bot invariant: every teams channel on a host is the SAME bot
+// (identical credential NAMES + tenant), no two channels bind the same conversation, and
+// there is at most one catch-all (conversation-less) channel.
+func (teamsKind) Validate(name string, cfg config.Transport, existing map[string]config.Transport) error {
+	conv := cfg.Options["conversationId"]
+	for n, e := range existing {
+		if n == name || e.Kind != "teams" {
+			continue
+		}
+		if e.TokenEnv != cfg.TokenEnv || e.UserEnv != cfg.UserEnv ||
+			e.TokenVault != cfg.TokenVault || e.UserVault != cfg.UserVault {
+			return fmt.Errorf("teams channel %q uses different bot credentials — all teams channels on a host share ONE bot (same --token-env / --user-env)", n)
+		}
+		if e.Options["tenantId"] != cfg.Options["tenantId"] {
+			return fmt.Errorf("teams channel %q has a different tenantId — one bot, one tenant", n)
+		}
+		if conv != "" && e.Options["conversationId"] == conv {
+			return fmt.Errorf("teams channel %q already binds conversation %q", n, conv)
+		}
+		if conv == "" && e.Options["conversationId"] == "" {
+			return fmt.Errorf("a catch-all teams channel already exists (%q) — only one conversation-less teams channel is allowed", n)
+		}
+	}
+	return nil
 }
 
 func (teamsKind) Test(ctx context.Context, name string, cfg config.Transport, res *SecretResolver) ([]string, error) {
@@ -59,12 +96,18 @@ func (teamsKind) Test(ctx context.Context, name string, cfg config.Transport, re
 }
 
 func (teamsKind) AddHints(name string, cfg config.Transport) []string {
-	return []string{
-		fmt.Sprintf("set your Azure Bot messaging endpoint to https://<host>%s", teamsPath(name, cfg)),
-		fmt.Sprintf("enable the Teams channel on the bot, then sideload the app package — see docs/TEAMS-BOT-SETUP.md"),
+	hints := []string{
+		fmt.Sprintf("set your Azure Bot messaging endpoint to https://<host>%s (shared by every teams channel)", teamsPath(name, cfg)),
+		"enable the Teams channel on the bot, then sideload the app package — see docs/TEAMS-BOT-SETUP.md",
 		fmt.Sprintf("App ID env: $%s  ·  client-secret env: $%s",
 			envNameOr(cfg.UserEnv, "TEAMS_BOT_APP_ID"), envNameOr(cfg.TokenEnv, "TEAMS_BOT_PASSWORD")),
 	}
+	if cfg.Options["conversationId"] == "" {
+		hints = append(hints, "no --conversation set: this is the CATCH-ALL channel — it receives every conversation the bot is in that no other teams channel binds (how you discover conversation ids)")
+	} else {
+		hints = append(hints, fmt.Sprintf("bound to conversation %s — only that conversation routes here; replies target it automatically", cfg.Options["conversationId"]))
+	}
+	return hints
 }
 
 // Connect prints the messaging-endpoint the owner must register in the Azure Bot — no
@@ -111,12 +154,17 @@ func teamsPath(name string, cfg config.Transport) string {
 	return "/webhook/teams"
 }
 
-// teamsChannel is one Teams bot: inbound via the Bot Framework Activity webhook
-// (Teams/the Bot Connector POSTs Activities, signed with a Bot Connector JWT we verify
-// against the OpenID metadata), outbound via the Bot Connector conversations REST API
-// authenticated with an AAD client-credentials token. Send + inbound share this ONE
-// object, so the last-seen serviceUrl persists in memory for proactive sends. Secrets
-// (App ID, client secret) are resolved by NAME at the point of use — never logged.
+// teamsServiceURLs maps a Teams conversationId -> its last-seen Bot Connector serviceUrl.
+// One bot per host, so this is process-global: the shared inbound stream records it from
+// each Activity and any channel's proactive Send reads it to reach that conversation
+// (falling back to the channel's options["serviceUrl"]).
+var teamsServiceURLs sync.Map
+
+// teamsChannel is the OUTBOUND half of one named Teams conversation: Send posts an
+// Activity to the Bot Connector conversations REST API authenticated with an AAD
+// client-credentials token. Inbound for every teams channel is handled by the shared
+// teamsStream (not here). Secrets (App ID, client secret) are resolved by NAME at the
+// point of use — never logged.
 type teamsChannel struct {
 	name string
 	cfg  config.Transport
@@ -125,16 +173,25 @@ type teamsChannel struct {
 	mu         sync.Mutex
 	tokenCache string
 	tokenExp   time.Time
-	serviceURL string // last-seen (from inbound) — persisted so proactive Send works
 }
 
 func openTeams(name string, cfg config.Transport, res *SecretResolver) (Channel, error) {
-	return &teamsChannel{name: name, cfg: cfg, res: res, serviceURL: cfg.Options["serviceUrl"]}, nil
+	return &teamsChannel{name: name, cfg: cfg, res: res}, nil
 }
 
 func (c *teamsChannel) Name() string { return c.name }
 func (c *teamsChannel) Kind() string { return "teams" }
-func (c *teamsChannel) Path() string { return teamsPath(c.name, c.cfg) }
+
+// resolveServiceURL finds the Bot Connector base for a conversation: the live value the
+// shared stream learned from inbound, else the channel's configured options["serviceUrl"].
+func (c *teamsChannel) resolveServiceURL(convID string) string {
+	if v, ok := teamsServiceURLs.Load(convID); ok {
+		if s, _ := v.(string); s != "" {
+			return s
+		}
+	}
+	return c.cfg.Options["serviceUrl"]
+}
 
 // loginURL is the AAD token endpoint. options["loginURL"] lets tests point it at a
 // local server. Single-tenant (tenantId set) uses the AAD tenant token endpoint;
@@ -279,7 +336,73 @@ func teamsAttachmentType(contentType string) string {
 	}
 }
 
-func (c *teamsChannel) Handler(pub Publisher) http.Handler {
+// teamsStream is the ONE shared inbound webhook over every teams channel (mirrors
+// whatsappStream). It owns the single /webhook/teams mount, verifies the Bot Connector
+// JWT once, and routes each Activity to the bound channel by conversation.id. bot is a
+// representative channel handle reused for JWT verification and media downloads (all
+// teams channels are the same bot, enforced by Validate).
+type teamsStream struct {
+	byConversation  map[string]string // conversationId -> channel name
+	catchAll        string            // conversation-less channel (or "")
+	accounts        map[string]string // channel name -> account
+	bot             *teamsChannel     // representative handle: JWT verify + media AAD token
+	path            string
+	insecureSkipJWT bool
+}
+
+func openTeamsStream(chans map[string]config.Transport, res *SecretResolver) (Streamer, error) {
+	if len(chans) == 0 {
+		return nil, fmt.Errorf("channel: teams stream: no channels")
+	}
+	names := make([]string, 0, len(chans))
+	for n := range chans {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+
+	s := &teamsStream{byConversation: map[string]string{}, accounts: map[string]string{}}
+	for _, n := range names {
+		cfg := chans[n]
+		s.accounts[n] = cfg.Account
+		if conv := cfg.Options["conversationId"]; conv != "" {
+			s.byConversation[conv] = n
+		} else if s.catchAll == "" {
+			s.catchAll = n // first conversation-less channel is the catch-all
+		}
+		if s.bot == nil {
+			bc, err := openTeams(n, cfg, res)
+			if err != nil {
+				return nil, err
+			}
+			s.bot = bc.(*teamsChannel)
+			s.path = teamsPath(n, cfg)
+			s.insecureSkipJWT = cfg.Options["insecureSkipJWT"] == "true"
+		}
+	}
+	return s, nil
+}
+
+// Path/Handler/UseCallback/Run make the stream a WebhookInbound the runtime mounts. Teams
+// inbound is pushed by the Bot Connector from the internet straight to the Azure-registered
+// endpoint, so there is no loopback URL to seed (UseCallback is a no-op) and no subprocess
+// to run — Run just holds until shutdown.
+func (s *teamsStream) Path() string       { return s.path }
+func (s *teamsStream) UseCallback(string) {}
+func (s *teamsStream) Run(ctx context.Context, _ Publisher) error {
+	<-ctx.Done()
+	return nil
+}
+
+// route returns the channel bound to convID, else the catch-all, else "" (dropped —
+// exactly like whatsapp: a conversation no channel owns is not delivered).
+func (s *teamsStream) route(convID string) string {
+	if n, ok := s.byConversation[convID]; ok {
+		return n
+	}
+	return s.catchAll
+}
+
+func (s *teamsStream) Handler(pub Publisher) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -292,8 +415,8 @@ func (c *teamsChannel) Handler(pub Publisher) http.Handler {
 		}
 		// Verify the Bot Connector JWT unless explicitly disabled for local/dev behind a
 		// trusted proxy (options["insecureSkipJWT"] = "true").
-		if c.cfg.Options["insecureSkipJWT"] != "true" {
-			if err := c.verifyInboundJWT(r.Context(), r.Header.Get("Authorization")); err != nil {
+		if !s.insecureSkipJWT {
+			if err := s.bot.verifyInboundJWT(r.Context(), r.Header.Get("Authorization")); err != nil {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
@@ -303,16 +426,23 @@ func (c *teamsChannel) Handler(pub Publisher) http.Handler {
 			http.Error(w, "bad activity", http.StatusBadRequest)
 			return
 		}
-		// Persist the per-activity serviceUrl so a later proactive Send can reach Teams.
-		if act.ServiceURL != "" {
-			c.mu.Lock()
-			c.serviceURL = act.ServiceURL
-			c.mu.Unlock()
+		convID := ""
+		if act.Conversation != nil {
+			convID = act.Conversation.ID
+		}
+		// Record the per-conversation serviceUrl so a later proactive Send can reach it.
+		if act.ServiceURL != "" && convID != "" {
+			teamsServiceURLs.Store(convID, act.ServiceURL)
 		}
 		// Only message activities carry user text/media; ack everything else (typing,
 		// conversationUpdate, …) without publishing.
 		if act.Type != "" && act.Type != "message" {
 			w.WriteHeader(http.StatusOK)
+			return
+		}
+		name := s.route(convID)
+		if name == "" {
+			w.WriteHeader(http.StatusOK) // no channel bound to this conversation — dropped
 			return
 		}
 		sender := ""
@@ -322,14 +452,12 @@ func (c *teamsChannel) Handler(pub Publisher) http.Handler {
 				sender = act.From.ID
 			}
 		}
-		env := envelope.Inbound(c.name, sender, act.Text, "Teams")
-		env.Account = c.cfg.Account
+		env := envelope.Inbound(name, sender, act.Text, "Teams")
+		env.Account = s.accounts[name]
 		if act.ID != "" {
 			env.ID = act.ID
 		}
-		if act.Conversation != nil {
-			env.ThreadID = act.Conversation.ID
-		}
+		env.ThreadID = convID
 		for _, a := range act.Attachments {
 			du := a.downloadURL()
 			if du == "" {
@@ -338,7 +466,7 @@ func (c *teamsChannel) Handler(pub Publisher) http.Handler {
 			att := envelope.Attachment{Type: teamsAttachmentType(a.ContentType), Name: a.Name, MIME: a.ContentType}
 			// Best-effort download: on ANY failure the envelope still ships with the
 			// metadata-only attachment — a message is never dropped.
-			if path, size, err := c.download(r.Context(), du, env.ID, a.Name); err == nil {
+			if path, size, err := s.bot.download(r.Context(), du, env.ID, a.Name); err == nil {
 				att.Path = path
 				att.Size = size
 			} else {
@@ -402,9 +530,7 @@ func (c *teamsChannel) Send(ctx context.Context, env envelope.Envelope) (string,
 	if convID == "" {
 		return "", fmt.Errorf("channel: teams %q: no target (pass --to or configure --conversation)", c.name)
 	}
-	c.mu.Lock()
-	serviceURL := c.serviceURL
-	c.mu.Unlock()
+	serviceURL := c.resolveServiceURL(convID)
 	if serviceURL == "" {
 		return "", fmt.Errorf("channel: teams %q: no serviceUrl yet (set options.serviceUrl or wait for an inbound message)", c.name)
 	}

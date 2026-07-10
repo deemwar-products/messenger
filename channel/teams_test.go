@@ -310,56 +310,105 @@ func TestTeamsVerifyInboundJWT(t *testing.T) {
 	}
 }
 
-// TestTeamsHandlerInbound drives a full inbound Activity through the Pushed handler with
-// JWT verification skipped (insecure dev mode) and asserts the published envelope +
-// serviceUrl persistence.
-func TestTeamsHandlerInbound(t *testing.T) {
+// TestTeamsStreamRouting drives inbound Activities through the ONE shared stream and
+// asserts routing by conversation.id (bound channel, catch-all, drop) + serviceUrl
+// recording, with JWT verification skipped (insecure dev mode).
+func TestTeamsStreamRouting(t *testing.T) {
 	res := NewSecretResolver(nil)
-	ch, _ := openTeams("t", teamsTestCfg(map[string]string{"insecureSkipJWT": "true"}), res)
-	tc := ch.(*teamsChannel)
+	// "eng" is bound to a conversation; "teams" (no conversationId) is the catch-all.
+	chans := map[string]config.Transport{
+		"eng":   teamsTestCfg(map[string]string{"insecureSkipJWT": "true", "conversationId": "19:eng@thread.tacv2"}),
+		"teams": teamsTestCfg(map[string]string{"insecureSkipJWT": "true"}),
+	}
+	st, err := openTeamsStream(chans, res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := st.(*teamsStream)
+	if ts.Path() != "/webhook/teams" {
+		t.Fatalf("path = %q", ts.Path())
+	}
 
 	var got envelope.Envelope
-	h := tc.Handler(func(e envelope.Envelope) { got = e })
+	h := ts.Handler(func(e envelope.Envelope) { got = e })
+	post := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/webhook/teams", strings.NewReader(body))
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return w
+	}
 
-	body := `{"type":"message","id":"act-9","text":"ping","serviceUrl":"https://smba.example/",
-		"from":{"id":"29:u","name":"Muthu"},"conversation":{"id":"19:c@thread.tacv2"}}`
-	req := httptest.NewRequest(http.MethodPost, "/webhook/teams", strings.NewReader(body))
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
+	// Bound conversation -> routed to "eng"; serviceUrl recorded for proactive Send.
+	got = envelope.Envelope{}
+	if w := post(`{"type":"message","id":"act-1","text":"ping","serviceUrl":"https://smba.example/",
+		"from":{"id":"29:u","name":"Muthu"},"conversation":{"id":"19:eng@thread.tacv2"}}`); w.Code != http.StatusOK {
 		t.Fatalf("status = %d", w.Code)
 	}
-	if got.Text != "ping" || got.Sender != "Muthu" || got.ThreadID != "19:c@thread.tacv2" {
-		t.Fatalf("envelope = %+v", got)
+	if got.Channel != "eng" || got.ThreadID != "19:eng@thread.tacv2" || got.Text != "ping" || got.Sender != "Muthu" {
+		t.Fatalf("bound-route envelope = %+v", got)
 	}
-	if got.ID != "act-9" || got.Origin != "Teams" {
+	if got.ID != "act-1" || got.Origin != "Teams" {
 		t.Fatalf("id/origin = %q/%q", got.ID, got.Origin)
 	}
-	// serviceUrl persisted for proactive Send.
-	tc.mu.Lock()
-	su := tc.serviceURL
-	tc.mu.Unlock()
-	if su != "https://smba.example/" {
-		t.Fatalf("serviceUrl not persisted: %q", su)
+	if v, ok := teamsServiceURLs.Load("19:eng@thread.tacv2"); !ok || v.(string) != "https://smba.example/" {
+		t.Fatalf("serviceUrl not recorded: %v ok=%v", v, ok)
+	}
+
+	// Unbound conversation -> catch-all "teams".
+	got = envelope.Envelope{}
+	post(`{"type":"message","id":"act-2","text":"hi","serviceUrl":"https://smba.example/",
+		"from":{"id":"29:v","name":"Ann"},"conversation":{"id":"19:random@thread.tacv2"}}`)
+	if got.Channel != "teams" || got.ThreadID != "19:random@thread.tacv2" {
+		t.Fatalf("catch-all envelope = %+v", got)
 	}
 
 	// Non-message activity is acked without publishing.
 	got = envelope.Envelope{}
-	req2 := httptest.NewRequest(http.MethodPost, "/webhook/teams",
-		strings.NewReader(`{"type":"conversationUpdate"}`))
-	w2 := httptest.NewRecorder()
-	h.ServeHTTP(w2, req2)
-	if w2.Code != http.StatusOK || got.Text != "" {
-		t.Fatalf("conversationUpdate should ack-only: code=%d env=%+v", w2.Code, got)
+	if w := post(`{"type":"conversationUpdate","conversation":{"id":"19:eng@thread.tacv2"}}`); w.Code != http.StatusOK || got.Text != "" {
+		t.Fatalf("conversationUpdate should ack-only: env=%+v", got)
+	}
+
+	// No catch-all configured: an unbound conversation is dropped (like whatsapp).
+	st2, _ := openTeamsStream(map[string]config.Transport{
+		"eng": teamsTestCfg(map[string]string{"insecureSkipJWT": "true", "conversationId": "19:eng@thread.tacv2"}),
+	}, res)
+	published := false
+	h2 := st2.(*teamsStream).Handler(func(envelope.Envelope) { published = true })
+	req := httptest.NewRequest(http.MethodPost, "/webhook/teams",
+		strings.NewReader(`{"type":"message","id":"act-3","text":"x","serviceUrl":"https://smba.example/","conversation":{"id":"19:nobody@thread.tacv2"}}`))
+	w := httptest.NewRecorder()
+	h2.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || published {
+		t.Fatalf("unbound-no-catchall should drop: code=%d published=%v", w.Code, published)
 	}
 }
 
 func TestTeamsValidateAndLane(t *testing.T) {
 	k := teamsKind{}
-	// Validate is permissive (Base default) — a fresh channel passes.
-	if err := k.Validate("t", teamsTestCfg(nil), map[string]config.Transport{}); err != nil {
-		t.Fatalf("validate: %v", err)
+	// A fresh channel with no siblings passes.
+	if err := k.Validate("teams", teamsTestCfg(nil), map[string]config.Transport{}); err != nil {
+		t.Fatalf("validate fresh: %v", err)
 	}
+	// A second conversation-less (catch-all) channel is rejected.
+	catchAll := map[string]config.Transport{"teams": teamsTestCfg(nil)}
+	if err := k.Validate("teams2", teamsTestCfg(nil), catchAll); err == nil {
+		t.Fatal("second catch-all should be rejected")
+	}
+	// A named channel binding a fresh conversation alongside the catch-all is fine.
+	if err := k.Validate("eng", teamsTestCfg(map[string]string{"conversationId": "19:eng"}), catchAll); err != nil {
+		t.Fatalf("named channel alongside catch-all: %v", err)
+	}
+	// Binding a conversation another channel already binds is rejected.
+	bound := map[string]config.Transport{"eng": teamsTestCfg(map[string]string{"conversationId": "19:eng"})}
+	if err := k.Validate("eng2", teamsTestCfg(map[string]string{"conversationId": "19:eng"}), bound); err == nil {
+		t.Fatal("duplicate conversation binding should be rejected")
+	}
+	// Different bot credentials are rejected (one bot per host).
+	diffCreds := config.Transport{Kind: "teams", TokenEnv: "OTHER_SECRET", UserEnv: "OTHER_APPID"}
+	if err := k.Validate("eng2", diffCreds, bound); err == nil {
+		t.Fatal("mismatched bot credentials should be rejected")
+	}
+
 	// Lane needs a token env.
 	if _, _, err := k.Lane("t", LaneParams{}, nil); err == nil {
 		t.Fatal("lane without token-env should error")

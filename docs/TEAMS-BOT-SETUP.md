@@ -5,8 +5,11 @@ connector. A bot can SEND and RECEIVE text **and attachments** to/from a specifi
 channel under its own bot identity. This is the only Teams transport that does
 attachments; the connector cannot.
 
-One `teams` channel = one bot bound to one conversation. Secrets are referenced by env
-NAME only — no secret value ever lives in config, logs, or the repo.
+Modelled like whatsapp: the host has ONE bot, and each `teams` channel is a named Teams
+**conversation** on it. One shared `/webhook/teams` serves them all and routes each
+message by `conversation.id` to the bound channel; a conversation-less channel is the
+catch-all. Secrets are referenced by env NAME only — no secret value ever lives in
+config, logs, or the repo.
 
 ---
 
@@ -96,7 +99,7 @@ messenger channel test teams
 | `serviceUrl` | initial/fallback Bot Connector base; auto-updated from each inbound activity |
 | `tenantId` | set for a **single-tenant** bot (switches the AAD token endpoint) |
 | `channelId` | optional Teams channel id, informational |
-| `path` | override the inbound mount (default `/webhook/teams`) — set when running a 2nd teams bot |
+| `path` | override the ONE shared inbound mount (default `/webhook/teams`; taken from the first teams channel) — rarely needed |
 | `publicURL` | hub public base; lets outbound attach local media as a `/media/<file>` link |
 | `insecureSkipJWT` | `"true"` disables inbound JWT verification — **local/dev behind a trusted proxy only** |
 

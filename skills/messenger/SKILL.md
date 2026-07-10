@@ -2,12 +2,12 @@
 name: messenger
 description: >
   Drive the standalone `messenger` product — a broker-free conversation hub over
-  telegram, whatsapp, and webhook channels, with threaded replies and durable consumer
-  subscriptions. Trigger when the user says: "set up messenger", "run messenger",
-  "listen for messages", "send a message on telegram/whatsapp", "reply to that message",
-  "start the messenger server", "wire a channel", "subscribe a consumer", "post to
-  /send", "poll the inbox". Use whenever a session needs to receive or send channel
-  messages without standing up a broker.
+  telegram, whatsapp, teams, and webhook channels, with threaded replies and durable
+  consumer subscriptions. Trigger when the user says: "set up messenger", "run
+  messenger", "listen for messages", "send a message on telegram/whatsapp/teams",
+  "create a teams bot", "reply to that message", "start the messenger server", "wire a
+  channel", "subscribe a consumer", "post to /send", "poll the inbox". Use whenever a
+  session needs to receive or send channel messages without standing up a broker.
 ---
 
 # messenger — the broker-free conversation hub (threaded, durable)
@@ -34,6 +34,8 @@ recipes below are how; that file is the law.
 - `references/whatsapp.md` — ONE global paired device, channels = groups, catch-all,
   pairing/JIDs, wacli gotchas
 - `references/telegram.md` — one bot per channel, setWebhook, chat ids, getMe checks
+- `references/teams.md` — **how to create a Teams bot** (Azure Bot + sideload), wire it,
+  conversation ids, attachments, JWT-verified inbound
 - `references/webhook.md` — HMAC signing recipe, accepted body fields, callbacks
 
 ## Recipe 0 — ALWAYS first: is the hub already running?
