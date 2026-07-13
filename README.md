@@ -26,6 +26,7 @@ webhook hooks  ─┘    thread_id, reply_to, ts}
 
 ```sh
 go build -o messenger ./cmd/messenger        # CGO_ENABLED=0, single static binary
+# on macOS prefer:  ./scripts/build.sh        # + ad-hoc codesign (avoids "Killed: 9" after a rebuild)
 
 messenger setup                              # scaffold ~/.config/messenger + guide
 messenger channel add whatsapp ops --group 123456789@g.us

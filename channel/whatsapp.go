@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -247,11 +249,27 @@ func (c *whatsappChannel) Send(ctx context.Context, env envelope.Envelope) (stri
 	if env.ReplyTo != "" {
 		args = append(args, "--reply-to", env.ReplyTo)
 	}
-	out, err := c.runCmd(ctx, waBin(c.cfg), args...)
+	out, err := c.sendWithReplyFallback(ctx, waBin(c.cfg), args, env.ReplyTo, env.Sender)
 	if err != nil {
 		return "", fmt.Errorf("channel: whatsapp: wacli send: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return parseWacliSendID(out), nil
+}
+
+// sendWithReplyFallback runs a wacli send and, when a GROUP reply fails because wacli's sync
+// store doesn't have the target message ("--reply-to-sender is required for unsynced group
+// replies"), retries ONCE adding --reply-to-sender <sender>. The inbound envelope already
+// carries the sender JID, so threaded group replies stay reliable even when the message
+// isn't in wacli's local store — the exact flakiness where the same reply worked once then
+// 502'd. A non-reply send, or one with no sender, is passed through unchanged.
+func (c *whatsappChannel) sendWithReplyFallback(ctx context.Context, bin string, args []string, replyTo, sender string) ([]byte, error) {
+	out, err := c.runCmd(ctx, bin, args...)
+	if err != nil && replyTo != "" && sender != "" && strings.Contains(string(out), "reply-to-sender") {
+		// Full-slice cap so the retry doesn't clobber the caller's args backing array.
+		retry := append(args[:len(args):len(args)], "--reply-to-sender", sender)
+		out, err = c.runCmd(ctx, bin, retry...)
+	}
+	return out, err
 }
 
 // sendFiles delivers env.Attachments via `wacli send file`, one call per attachment.
@@ -288,7 +306,7 @@ func (c *whatsappChannel) sendFiles(ctx context.Context, to string, env envelope
 		if env.ReplyTo != "" {
 			args = append(args, "--reply-to", env.ReplyTo)
 		}
-		out, err := c.runCmd(ctx, bin, args...)
+		out, err := c.sendWithReplyFallback(ctx, bin, args, env.ReplyTo, env.Sender)
 		if tmp != "" {
 			_ = os.Remove(tmp)
 		}
@@ -502,6 +520,44 @@ type waMessage struct {
 	FilenamePC  string `json:"Filename"`
 	MIMELC      string `json:"mime"`
 	MIMEPC      string `json:"MimeType"`
+
+	// Media is the LIVE wacli sync --webhook shape: media metadata is NOT a flat
+	// media_type on the message, it is a nested object (`"Media":{...}` — null for a
+	// plain text message). The flat fields above are the store/compact spellings; this
+	// covers the webhook that actually feeds the hub. Kept as raw JSON so a null or an
+	// unexpected inner shape never breaks parsing.
+	Media json.RawMessage `json:"media"`
+}
+
+// waMedia is the nested Media object wacli posts over the webhook for an attachment.
+// Field spellings are matched case-insensitively by encoding/json, so "MimeType",
+// "mimetype" and "Mimetype" all land here.
+type waMedia struct {
+	Kind      string `json:"kind"`
+	Type      string `json:"type"`
+	MediaType string `json:"mediatype"`
+	Mimetype  string `json:"mimetype"`
+	Mime      string `json:"mime"`
+	Name      string `json:"name"`
+	File      string `json:"file"`
+	Filename  string `json:"filename"`
+	Caption   string `json:"caption"`
+}
+
+// media returns the parsed nested Media object and whether the message carries one. A
+// missing, null, or unparseable Media is (nil,false) — the message is treated as
+// text-only.
+func (m waMessage) media() (*waMedia, bool) {
+	trimmed := bytes.TrimSpace(m.Media)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, false
+	}
+	var md waMedia
+	if json.Unmarshal(trimmed, &md) != nil {
+		// Present but not the object shape we know — still an attachment; download by id.
+		return &waMedia{}, true
+	}
+	return &md, true
 }
 
 func (m waMessage) id() string {
@@ -521,10 +577,49 @@ func firstNonEmpty(a, b string) string {
 	return b
 }
 
-func (m waMessage) mediaType() string { return firstNonEmpty(m.MediaTypeLC, m.MediaTypePC) }
-func (m waMessage) caption() string   { return firstNonEmpty(m.CaptionLC, m.CaptionPC) }
-func (m waMessage) filename() string  { return firstNonEmpty(m.FilenameLC, m.FilenamePC) }
-func (m waMessage) mime() string      { return firstNonEmpty(m.MIMELC, m.MIMEPC) }
+// mediaType reports the attachment type. It prefers the flat store/compact fields, then
+// the nested webhook Media object. A message that carries a Media object but no
+// recognizable type string still reports "file" so it is ALWAYS treated as an
+// attachment (and downloaded) — a voice note must never be dropped to text-only.
+func (m waMessage) mediaType() string {
+	if t := firstNonEmpty(m.MediaTypeLC, m.MediaTypePC); t != "" {
+		return t
+	}
+	if md, ok := m.media(); ok {
+		if t := firstNonEmpty(firstNonEmpty(md.Kind, md.Type), md.MediaType); t != "" {
+			return t
+		}
+		return "file" // has an attachment, type unknown — never drop it
+	}
+	return ""
+}
+func (m waMessage) caption() string {
+	if c := firstNonEmpty(m.CaptionLC, m.CaptionPC); c != "" {
+		return c
+	}
+	if md, ok := m.media(); ok {
+		return md.Caption
+	}
+	return ""
+}
+func (m waMessage) filename() string {
+	if f := firstNonEmpty(m.FilenameLC, m.FilenamePC); f != "" {
+		return f
+	}
+	if md, ok := m.media(); ok {
+		return firstNonEmpty(md.Name, md.File)
+	}
+	return ""
+}
+func (m waMessage) mime() string {
+	if mm := firstNonEmpty(m.MIMELC, m.MIMEPC); mm != "" {
+		return mm
+	}
+	if md, ok := m.media(); ok {
+		return firstNonEmpty(md.Mimetype, md.Mime)
+	}
+	return ""
+}
 
 // attachmentType maps wacli's media type names onto envelope.Attachment.Type
 // (image | video | audio | voice | document | file). ptt is WhatsApp's push-to-talk
@@ -551,9 +646,16 @@ func attachmentType(mediaType string) string {
 func (s *whatsappStream) route(chat string) string { return s.byGroup[chat] }
 
 // Run launches the long-lived `wacli sync --follow --webhook …` subprocess that holds
-// the connection and POSTs inbound to our handler. stdout carries only lifecycle noise
-// (messages arrive over the webhook), so it is drained, not parsed. The runtime
-// supervises this with backoff on exit.
+// the connection and POSTs inbound to our handler. stdout carries lifecycle noise
+// (messages arrive over the webhook) and is drained — EXCEPT we watch for one fatal
+// case: wacli exiting immediately because the store is already locked by ANOTHER wacli
+// (`{"event":"error","data":{"message":"store is locked ... pid=N"}}`). The device is
+// global and single-hub by design — exactly one wacli sync may hold the store — so any
+// other process holding it is a stray (the classic dual-instance "device theft": a
+// leftover legacy listener grabs the lock and starves the hub, and the supervisor then
+// blind-loops the exit-1 forever). When we see that, we REAP the strayed holder (only
+// if it is really a wacli process and not us) and retry the sync ONCE inline, so the
+// stream self-heals instead of looping. The runtime still supervises the outer error.
 func (s *whatsappStream) Run(ctx context.Context, _ Publisher) error {
 	args := s.args
 	if len(args) == 0 {
@@ -565,29 +667,84 @@ func (s *whatsappStream) Run(ctx context.Context, _ Publisher) error {
 			args = append(args, "--webhook-secret", s.secret)
 		}
 	}
-	cmd := s.commandContext(ctx, s.bin, args...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("channel: whatsapp: start %q: %w", s.bin, err)
-	}
-	// Drain stdout so the pipe never blocks the subprocess; inbound is on the webhook.
-	go func() {
-		sc := bufio.NewScanner(stdout)
-		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for sc.Scan() {
-		}
-	}()
-	waitErr := cmd.Wait()
+	waitErr, lockPID := s.runSync(ctx, args)
 	if ctx.Err() != nil {
 		return nil // cancelled: clean stop
 	}
-	if waitErr != nil {
-		return fmt.Errorf("channel: whatsapp: wacli exited: %w", waitErr)
+	if waitErr == nil {
+		return nil
 	}
-	return nil
+	// Store locked by a stray wacli: reap it (never ourselves) and retry once inline.
+	if lockPID > 0 && reapStrayWacli(lockPID) {
+		fmt.Printf("messenger: whatsapp reaped stray wacli holding the store (pid=%d), retrying sync\n", lockPID)
+		waitErr, _ = s.runSync(ctx, args)
+		if ctx.Err() != nil {
+			return nil
+		}
+		if waitErr == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("channel: whatsapp: wacli exited: %w", waitErr)
+}
+
+// storeLockedRe pulls the offending PID out of wacli's store-locked error line.
+var storeLockedRe = regexp.MustCompile(`store is locked[^}]*pid=(\d+)`)
+
+// runSync runs one wacli sync subprocess to completion, draining stdout while sniffing
+// it for a store-locked error. It returns the subprocess exit error and, if the exit was
+// caused by another wacli holding the store, that holder's PID (else 0).
+func (s *whatsappStream) runSync(ctx context.Context, args []string) (error, int) {
+	cmd := s.commandContext(ctx, s.bin, args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err, 0
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("channel: whatsapp: start %q: %w", s.bin, err), 0
+	}
+	lockPID := make(chan int, 1)
+	go func() {
+		found := 0
+		sc := bufio.NewScanner(stdout)
+		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for sc.Scan() {
+			if found == 0 {
+				if mm := storeLockedRe.FindSubmatch(sc.Bytes()); mm != nil {
+					if pid, e := strconv.Atoi(string(mm[1])); e == nil {
+						found = pid
+					}
+				}
+			}
+		}
+		lockPID <- found
+	}()
+	waitErr := cmd.Wait()
+	return waitErr, <-lockPID
+}
+
+// reapStrayWacli kills the process holding wacli's store lock — but ONLY when it is
+// genuinely a wacli process and not this hub's own process tree. Returns true if it
+// reaped something. This enforces the single-hub invariant: one device, one wacli.
+func reapStrayWacli(pid int) bool {
+	if pid <= 0 || pid == os.Getpid() {
+		return false
+	}
+	// Verify it's actually a wacli process before killing anything.
+	out, err := exec.Command("ps", "-o", "comm=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil || !strings.Contains(strings.ToLower(string(out)), "wacli") {
+		return false
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	if err := proc.Kill(); err != nil {
+		return false
+	}
+	// Give the OS a moment to release the flock before the caller retries.
+	time.Sleep(500 * time.Millisecond)
+	return true
 }
 
 // ingest parses a wacli webhook body — a single message object, a `{message|data:{…}}`
@@ -674,9 +831,15 @@ func (s *whatsappStream) publishMessage(ctx context.Context, raw json.RawMessage
 	pub(env)
 }
 
-// downloadMedia shells `wacli media download` into home.MediaDir() and returns the
-// stored file's path, or "" on any failure (the caller publishes regardless). wacli
-// serializes device access itself, so running inline on the stream is fine.
+// downloadMedia shells `wacli --read-only media download` into home.MediaDir() and
+// returns the stored file's path, or "" on any failure (the caller publishes
+// regardless). --read-only (with an explicit --output) is required here: the hub's
+// long-lived `wacli sync --follow` subprocess (Run, above) holds wacli's store lock for
+// its entire lifetime, so a second, non-read-only `wacli media download` invocation
+// always fails with "store is locked" (it tries to write local_path/downloaded_at back
+// into wacli.db). --read-only fetches the media over the WhatsApp connection without
+// touching the store at all, sidestepping the lock entirely — verified against a live
+// wacli 0.11.1 store with sync --follow running.
 func (s *whatsappStream) downloadMedia(ctx context.Context, chat, id string) string {
 	if chat == "" || id == "" {
 		return ""
@@ -685,7 +848,7 @@ func (s *whatsappStream) downloadMedia(ctx context.Context, chat, id string) str
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return ""
 	}
-	out, err := s.runCmd(ctx, s.bin, "media", "download", "--chat", chat, "--id", id, "--output", dir, "--json")
+	out, err := s.runCmd(ctx, s.bin, "--read-only", "media", "download", "--chat", chat, "--id", id, "--output", dir, "--json")
 	if err != nil {
 		return ""
 	}

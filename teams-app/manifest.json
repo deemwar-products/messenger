@@ -1,0 +1,47 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.16",
+  "version": "1.0.0",
+  "id": "FILL: NEW-GUID-FOR-THIS-APP-PACKAGE",
+  "developer": {
+    "name": "FILL: Your Company",
+    "websiteUrl": "https://FILL.example.com",
+    "privacyUrl": "https://FILL.example.com/privacy",
+    "termsOfUseUrl": "https://FILL.example.com/terms"
+  },
+  "name": {
+    "short": "FILL: Messenger Bot",
+    "full": "FILL: Messenger Hub Bot"
+  },
+  "description": {
+    "short": "FILL: short description (< 80 chars)",
+    "full": "FILL: full description of what this bot does"
+  },
+  "icons": {
+    "color": "color.png",
+    "outline": "outline.png"
+  },
+  "accentColor": "#2A6DF4",
+  "bots": [
+    {
+      "botId": "FILL: TEAMS_BOT_APP_ID (the Azure Bot Microsoft App ID)",
+      "scopes": ["team", "groupchat", "personal"],
+      "supportsFiles": true,
+      "isNotificationOnly": false
+    }
+  ],
+  "validDomains": ["FILL: your-public-host-no-scheme.example.com"],
+  "webApplicationInfo": {
+    "id": "FILL: TEAMS_BOT_APP_ID (the Azure Bot Microsoft App ID)",
+    "resource": "api://FILL: your-public-host-no-scheme.example.com/FILL: TEAMS_BOT_APP_ID"
+  },
+  "authorization": {
+    "permissions": {
+      "orgWide": [],
+      "resourceSpecific": [
+        { "name": "ChannelMessage.Read.Group", "type": "Application" },
+        { "name": "Channel.Create.Group", "type": "Application" }
+      ]
+    }
+  }
+}

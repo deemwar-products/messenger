@@ -19,10 +19,18 @@ package channel
 
 import (
 	"context"
+	"errors"
 	"net/http"
 
 	"github.com/deemwar-products/messenger/envelope"
 )
+
+// ErrNoOutbound marks a Send against a channel that is configured inbound-only and so can
+// never deliver outbound (a webhook with no callbackURL). It is a configuration
+// precondition — retrying the same request cannot succeed — so the HTTP surface maps it to
+// a 4xx (422) rather than a 502 gateway failure, which would read as a transient upstream
+// fault and invite pointless retries. Distinguish it with errors.Is(err, ErrNoOutbound).
+var ErrNoOutbound = errors.New("channel: inbound-only, no outbound target configured")
 
 // Publisher is the single seam every ingress path uses to emit a normalized Envelope.
 // The runtime injects one that fans out to the inbox + subscriptions; tests inject a
