@@ -25,12 +25,36 @@ type Runtime struct {
 
 	mu       sync.Mutex
 	channels map[string]Channel
+	streams  map[string]*StreamState
 	mux      *http.ServeMux
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 
 	restartMin time.Duration
 	restartMax time.Duration
+}
+
+// StreamState is the observable liveness of one supervised streaming kind (whatsapp: the
+// one wacli subprocess). The supervisor updates it across Run/exit/restart so `/health`
+// can report a listener that died or is stuck in a backoff loop — no host-process forensics
+// (`pgrep`/`whoami`) needed. Times are RFC3339; zero times render as empty.
+type StreamState struct {
+	Running   bool      `json:"running"`
+	Restarts  int       `json:"restarts"`
+	StartedAt time.Time `json:"started_at,omitempty"`
+	LastExit  time.Time `json:"last_exit_at,omitempty"`
+	LastErr   string    `json:"last_error,omitempty"`
+}
+
+// StreamHealth returns a snapshot of every supervised stream's liveness, keyed by kind.
+func (rt *Runtime) StreamHealth() map[string]StreamState {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	out := make(map[string]StreamState, len(rt.streams))
+	for k, s := range rt.streams {
+		out[k] = *s
+	}
+	return out
 }
 
 // NewRuntime builds a runtime over the enabled channel configs. pub is where every
@@ -45,6 +69,7 @@ func NewRuntime(seed map[string]config.Transport, res *SecretResolver, pub Publi
 	return &Runtime{
 		res: res, pub: pub, seed: seed,
 		channels:   map[string]Channel{},
+		streams:    map[string]*StreamState{},
 		mux:        http.NewServeMux(),
 		restartMin: 500 * time.Millisecond,
 		restartMax: 30 * time.Second,
@@ -140,10 +165,18 @@ func (rt *Runtime) Up(ctx context.Context) error {
 // a healthy run), isolated from everything else.
 func (rt *Runtime) supervise(ctx context.Context, kind string, st Streamer) {
 	defer rt.wg.Done()
+	rt.markStream(kind, func(s *StreamState) { s.Running = true; s.StartedAt = time.Now() })
 	delay := rt.restartMin
 	for {
 		started := time.Now()
 		err := st.Run(ctx, rt.pub)
+		rt.markStream(kind, func(s *StreamState) {
+			s.Running = false
+			s.LastExit = time.Now()
+			if err != nil {
+				s.LastErr = err.Error()
+			}
+		})
 		if ctx.Err() != nil || err == nil {
 			return
 		}
@@ -160,7 +193,21 @@ func (rt *Runtime) supervise(ctx context.Context, kind string, st Streamer) {
 		if delay > rt.restartMax {
 			delay = rt.restartMax
 		}
+		rt.markStream(kind, func(s *StreamState) { s.Running = true; s.Restarts++; s.StartedAt = time.Now() })
 	}
+}
+
+// markStream mutates a stream's liveness under the runtime lock, creating the entry on
+// first sight.
+func (rt *Runtime) markStream(kind string, fn func(*StreamState)) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	s := rt.streams[kind]
+	if s == nil {
+		s = &StreamState{}
+		rt.streams[kind] = s
+	}
+	fn(s)
 }
 
 // Down cancels every stream and waits for the goroutines to exit.

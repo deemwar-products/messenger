@@ -8,6 +8,7 @@ package server
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"io"
 	"mime"
 	"net/http"
@@ -69,7 +70,14 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	// "service" self-identifies the hub so the single-instance probe (and any client)
 	// can tell a running messenger from an unrelated server on the same port.
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "service": "messenger", "channels": s.rt.Channels()})
+	// "streams" reports per-kind liveness of supervised streaming channels (whatsapp's one
+	// wacli subprocess) so a monitor can see a listener that died or is looping in backoff
+	// without host-process forensics. Empty when no streaming channels are configured.
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "service": "messenger",
+		"channels": s.rt.Channels(),
+		"streams":  s.rt.StreamHealth(),
+	})
 }
 
 // sendReq is the POST /send body: channel plus text and/or attachments, with optional
@@ -143,6 +151,15 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) {
 	})
 	id, err := s.rt.Send(r.Context(), env)
 	if err != nil {
+		// A channel that is inbound-only (no outbound target) is a config precondition, not
+		// a gateway failure: answer 422 with a structured, actionable body so a caller fixes
+		// config instead of retrying a 502 forever. Genuine delivery failures stay 502.
+		if errors.Is(err, channel.ErrNoOutbound) {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+				"ok": false, "error": err.Error(), "channel": req.Channel, "reason": "inbound_only",
+			})
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}

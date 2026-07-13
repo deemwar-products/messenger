@@ -133,7 +133,9 @@ func (h *webhookChannel) Handler(pub Publisher) http.Handler {
 func (h *webhookChannel) Send(ctx context.Context, env envelope.Envelope) (string, error) {
 	callback := h.cfg.Options["callbackURL"]
 	if callback == "" {
-		return "", fmt.Errorf("channel: webhook %q: no callbackURL", h.name)
+		// Inbound-only channel: no outbound target. Wrap the sentinel so the HTTP surface
+		// answers a config precondition with 422, not a 502 gateway error.
+		return "", fmt.Errorf("channel: webhook %q: %w (set options.callbackURL to enable /send)", h.name, ErrNoOutbound)
 	}
 	body, _ := json.Marshal(env)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, callback, bytes.NewReader(body))

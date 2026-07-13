@@ -47,11 +47,19 @@ never bearer-auth'd (webhooks carry their own per-channel HMAC/secret).
 ## GET /health
 
 ```json
-{"ok": true, "service": "messenger", "channels": {"ops": "whatsapp", "mybot": "telegram"}}
+{"ok": true, "service": "messenger",
+ "channels": {"ops": "whatsapp", "mybot": "telegram"},
+ "streams": {"whatsapp": {"running": true, "restarts": 0, "started_at": "2026-07-13T10:00:00Z"}}}
 ```
 
 `"service":"messenger"` is the single-instance probe: clients (and `serve` itself) use
 it to detect a running hub and REUSE it rather than start another.
+
+`streams` reports per-kind liveness of supervised STREAMING channels (whatsapp's single
+`wacli` subprocess): `running`, cumulative `restarts`, `started_at`, and — if it has failed
+— `last_exit_at` and `last_error`. A listener that died and is looping in backoff reads
+`running:false` / rising `restarts` / a `last_error`, so a monitor catches it WITHOUT
+`pgrep`/`whoami` forensics. The map is empty when no streaming channels are configured.
 
 ## POST /send
 
@@ -84,7 +92,23 @@ Response `200`:
 `id` is the PROVIDER-assigned message id of your outbound message (telegram
 `message_id`, wacli id; falls back to the minted envelope id) — pass it as a future
 `reply_to` to thread onto your own send. Errors: `400` bad/missing fields, `401` auth,
-`409` reply_to:"last" with no history, `502` delivery failure (body = reason).
+`409` reply_to:"last" with no history, `422` the channel is inbound-only (see below),
+`502` a genuine downstream delivery failure (body = reason).
+
+**`422` inbound-only vs `502` gateway failure.** A webhook channel with no
+`options.callbackURL` can RECEIVE (signed `POST /webhook/<name>`) but has no outbound
+target, so `/send` to it can never succeed. That is a config precondition, not a transient
+fault, so it answers a LOUD, structured `422` — not a `502`, which reads as an upstream
+blip and invites endless retries:
+
+```json
+{"ok": false, "error": "channel: webhook \"hook\": channel: inbound-only, no outbound target configured (set options.callbackURL to enable /send)", "channel": "hook", "reason": "inbound_only"}
+```
+
+Set `options.callbackURL` to make the channel outbound-capable. A `502` is reserved for a
+configured downstream that is unreachable or returns a non-2xx. (This resolves the historic
+"`/send` 502s silently while the signed webhook path works" asymmetry: outbound needs a
+delivery target; inbound does not.)
 
 ## GET /inbox?since=N
 
