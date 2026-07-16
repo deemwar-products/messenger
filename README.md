@@ -1,5 +1,7 @@
 # messenger
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/deemwar-products/messenger.svg)](https://pkg.go.dev/github.com/deemwar-products/messenger)
+
 Broker-free **conversation hub** as one static Go binary. It owns receiving and sending
 messages over **telegram**, **whatsapp**, and generic **webhook** channels, and delivers
 inbound messages to N consumers with durable per-consumer cursors — so any product (a
