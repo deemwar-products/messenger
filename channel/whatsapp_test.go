@@ -296,6 +296,56 @@ func TestWhatsappSend_NonReplyFailureNotRetried(t *testing.T) {
 	}
 }
 
+// The delivered-send-never-retries invariant: a caller whose OWN context is already
+// cancelled (an impatient CLI wrapper's short deadline, an HTTP client that walked away)
+// must not abort a wacli dispatch that may already be in flight to WhatsApp. Send/sendFiles
+// detach the wacli invocation from the caller's context (dispatchContext), so the fake
+// runCmd here must still be called with a live, non-cancelled context and must still run to
+// completion exactly once — proving a caller-side cancellation can never turn a real send
+// into a false failure (the false failure is what invites a caller retry and the resulting
+// duplicate delivery).
+func TestWhatsappSend_SurvivesCallerContextCancellation(t *testing.T) {
+	callerCtx, cancel := context.WithCancel(context.Background())
+	cancel() // caller already gave up before Send is even invoked
+
+	var calls int
+	run := func(runCtx context.Context, _ string, _ ...string) ([]byte, error) {
+		calls++
+		if err := runCtx.Err(); err != nil {
+			t.Fatalf("wacli dispatch context must be detached from the caller's, got already-done: %v", err)
+		}
+		return []byte(`{"success":true,"data":{"id":"WAMID-SURVIVED"}}`), nil
+	}
+
+	t.Run("text", func(t *testing.T) {
+		calls = 0
+		ch := &whatsappChannel{name: "ops", cfg: config.Transport{Options: map[string]string{"group": "111@g.us"}}, runCmd: run}
+		id, err := ch.Send(callerCtx, envelope.Envelope{Channel: "ops", Text: "hi"})
+		if err != nil {
+			t.Fatalf("send must survive a cancelled caller context, got: %v", err)
+		}
+		if id != "WAMID-SURVIVED" || calls != 1 {
+			t.Fatalf("want exactly 1 dispatched send, got id=%q calls=%d", id, calls)
+		}
+	})
+
+	t.Run("file", func(t *testing.T) {
+		calls = 0
+		ch := &whatsappChannel{name: "ops", cfg: config.Transport{Options: map[string]string{"group": "111@g.us"}}, runCmd: run}
+		env := envelope.Envelope{
+			Channel:     "ops",
+			Attachments: []envelope.Attachment{{Type: "voice", Name: "note.ogg", Path: "/tmp/note.ogg"}},
+		}
+		id, err := ch.Send(callerCtx, env)
+		if err != nil {
+			t.Fatalf("send must survive a cancelled caller context, got: %v", err)
+		}
+		if id != "WAMID-SURVIVED" || calls != 1 {
+			t.Fatalf("want exactly 1 dispatched send (never a caller-cancellation-provoked retry), got id=%q calls=%d", id, calls)
+		}
+	})
+}
+
 // a stream media line publishes ONE envelope: text falls back to the caption, the
 // attachment carries normalized type + name + mime, and a successful `wacli media
 // download` fills Path (+ Size best-effort).

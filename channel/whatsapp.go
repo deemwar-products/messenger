@@ -230,6 +230,27 @@ func openWhatsapp(name string, cfg config.Transport, _ *SecretResolver) (Channel
 func (c *whatsappChannel) Name() string { return c.name }
 func (c *whatsappChannel) Kind() string { return "whatsapp" }
 
+// sendDispatchTimeout bounds one wacli send invocation, DETACHED from the caller's own
+// context (see dispatchContext). wacli's own attempt budget is 45s (sendAttemptTimeout in
+// wacli/cmd/wacli/send_helpers.go) and a retryable failure reconnects and tries a SECOND
+// 45s attempt — plus ffprobe/ffmpeg voice-note metadata probing and the media upload
+// itself for a large attachment. 150s gives that realistic worst case headroom without
+// being unboundedly long.
+const sendDispatchTimeout = 150 * time.Second
+
+// dispatchContext detaches a wacli send from the CALLER's cancellation (an impatient CLI
+// wrapper's own short deadline, an HTTP client that walked away) while still bounding it
+// with our own timeout. This is the delivered-send-never-retries invariant: once we shell
+// out to wacli, the message MAY already be in flight to WhatsApp's servers by the time it
+// would ack — killing that subprocess early doesn't undo the send, it just makes messenger
+// falsely report a failure, and a caller that reacts to a false failure by retrying
+// produces a genuine duplicate delivery. Letting the dispatch run to its OWN true
+// completion (success or real failure) means the result messenger reports is always
+// accurate, so there is never a false failure to retry.
+func dispatchContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), sendDispatchTimeout)
+}
+
 // Send shells wacli. Target = explicit ThreadID, else the channel's group. A plain
 // text envelope goes via `send text`; any attachments go via `send file` (one wacli
 // call per attachment, env.Text as the caption on the first). The wacli send id is
@@ -249,7 +270,9 @@ func (c *whatsappChannel) Send(ctx context.Context, env envelope.Envelope) (stri
 	if env.ReplyTo != "" {
 		args = append(args, "--reply-to", env.ReplyTo)
 	}
-	out, err := c.sendWithReplyFallback(ctx, waBin(c.cfg), args, env.ReplyTo, env.Sender)
+	sendCtx, cancel := dispatchContext(ctx)
+	defer cancel()
+	out, err := c.sendWithReplyFallback(sendCtx, waBin(c.cfg), args, env.ReplyTo, env.Sender)
 	if err != nil {
 		return "", fmt.Errorf("channel: whatsapp: wacli send: %w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -306,7 +329,9 @@ func (c *whatsappChannel) sendFiles(ctx context.Context, to string, env envelope
 		if env.ReplyTo != "" {
 			args = append(args, "--reply-to", env.ReplyTo)
 		}
-		out, err := c.sendWithReplyFallback(ctx, bin, args, env.ReplyTo, env.Sender)
+		sendCtx, cancel := dispatchContext(ctx)
+		out, err := c.sendWithReplyFallback(sendCtx, bin, args, env.ReplyTo, env.Sender)
+		cancel()
 		if tmp != "" {
 			_ = os.Remove(tmp)
 		}

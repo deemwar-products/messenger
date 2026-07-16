@@ -1151,7 +1151,12 @@ func cmdSend(args []string) error {
 		Origin:      "messenger",
 		Attachments: attachments,
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// 180s: comfortably above whatsapp's own internal sendDispatchTimeout (150s, itself
+	// sized off wacli's worst-case audio-send budget — see channel/whatsapp.go). A
+	// whatsapp send detaches from this context entirely (dispatchContext) so it can never
+	// be killed early into a false-failure; this outer bound just caps the CLI command as
+	// a whole for the other channel kinds, which do honor ctx cancellation.
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 	rt := channel.OpenSend(cfg, channel.NewSecretResolver(nil))
 	id, err := rt.Send(ctx, env)
