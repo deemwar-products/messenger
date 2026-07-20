@@ -1,5 +1,7 @@
 # messenger
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/deemwar-products/messenger.svg)](https://pkg.go.dev/github.com/deemwar-products/messenger)
+
 Broker-free **conversation hub** as one static Go binary. It owns receiving and sending
 messages over **telegram**, **whatsapp**, and generic **webhook** channels, and delivers
 inbound messages to N consumers with durable per-consumer cursors — so any product (a
@@ -26,6 +28,7 @@ webhook hooks  ─┘    thread_id, reply_to, ts}
 
 ```sh
 go build -o messenger ./cmd/messenger        # CGO_ENABLED=0, single static binary
+# on macOS prefer:  ./scripts/build.sh        # + ad-hoc codesign (avoids "Killed: 9" after a rebuild)
 
 messenger setup                              # scaffold ~/.config/messenger + guide
 messenger channel add whatsapp ops --group 123456789@g.us

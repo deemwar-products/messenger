@@ -133,7 +133,9 @@ func (h *webhookChannel) Handler(pub Publisher) http.Handler {
 func (h *webhookChannel) Send(ctx context.Context, env envelope.Envelope) (string, error) {
 	callback := h.cfg.Options["callbackURL"]
 	if callback == "" {
-		return "", fmt.Errorf("channel: webhook %q: no callbackURL", h.name)
+		// Inbound-only channel: no outbound target. Wrap the sentinel so the HTTP surface
+		// answers a config precondition with 422, not a 502 gateway error.
+		return "", fmt.Errorf("channel: webhook %q: %w (set options.callbackURL to enable /send)", h.name, ErrNoOutbound)
 	}
 	body, _ := json.Marshal(env)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, callback, bytes.NewReader(body))
@@ -172,6 +174,13 @@ func VerifyHMAC(secret, body []byte, sig string) bool {
 		return false
 	}
 	return hmac.Equal([]byte(SignHMAC(secret, body)), []byte(sig))
+}
+
+// NormalizeWebhook exposes normalizeWebhook to the HTTP surface: the universal hook
+// (POST /hook/send) reuses the same lenient payload shape so a signed peer injects a
+// message identically whether it hits a per-lane /webhook/<name> or the global /hook/send.
+func NormalizeWebhook(name, account string, body []byte) envelope.Envelope {
+	return normalizeWebhook(name, account, body)
 }
 
 // normalizeWebhook turns a verified payload into the canonical inbound Envelope. It

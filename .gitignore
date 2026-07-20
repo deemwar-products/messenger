@@ -1,5 +1,6 @@
 # build output
 /dist/
+/messenger
 
 # per-machine env (secrets live here, never committed)
 .env

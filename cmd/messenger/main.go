@@ -296,7 +296,7 @@ func readCursorFile(path string) int {
 
 func cmdChannel(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: messenger channel <add|list|remove|connect> ...")
+		return fmt.Errorf("usage: messenger channel <add|list|remove|connect|test|teams-create> ...")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -310,6 +310,8 @@ func cmdChannel(args []string) error {
 		return channelConnect(rest)
 	case "test":
 		return channelTest(rest)
+	case "teams-create":
+		return channelTeamsCreate(rest)
 	default:
 		return fmt.Errorf("unknown channel subcommand %q", sub)
 	}
@@ -359,6 +361,8 @@ func channelAdd(args []string) error {
 	tokenVault := fs.String("token-vault", "", "age vault entry NAME holding the token")
 	account := fs.String("account", "", "platform account/workspace label")
 	chatID := fs.String("chat-id", "", "telegram: default target chat/channel id")
+	userEnv := fs.String("user-env", "", "env var NAME holding the user/app identity (teams: the App ID)")
+	conversation := fs.String("conversation", "", "teams: default target conversation id")
 	group := fs.String("group", "", "whatsapp: the group JID this channel is bound to")
 	disabled := fs.Bool("disabled", false, "add the channel disabled")
 	opts := optionFlags{}
@@ -384,6 +388,9 @@ func channelAdd(args []string) error {
 	if *chatID != "" {
 		opts["chatId"] = *chatID
 	}
+	if *conversation != "" {
+		opts["conversationId"] = *conversation
+	}
 	if *group != "" {
 		opts["group"] = *group
 	}
@@ -396,6 +403,7 @@ func channelAdd(args []string) error {
 		Account:    *account,
 		TokenEnv:   *tokenEnv,
 		TokenVault: *tokenVault,
+		UserEnv:    *userEnv,
 		Options:    opts,
 	}
 	if err := k.Validate(name, want, cfg.Transports); err != nil {
@@ -412,6 +420,93 @@ func channelAdd(args []string) error {
 	for _, h := range k.AddHints(name, want) {
 		fmt.Println("  " + h)
 	}
+	return nil
+}
+
+// channelTeamsCreate creates a Teams channel via Graph (RSC Channel.Create.Group), borrowing
+// the bot credentials from an existing teams channel (one bot per host), and — because the
+// bot CREATED the channel — knows its conversationId immediately. With --as it registers a
+// bound messenger teams channel in one shot, no @mention / discovery needed.
+func channelTeamsCreate(args []string) error {
+	fs := flag.NewFlagSet("channel teams-create", flag.ContinueOnError)
+	cfgPath := fs.String("config", "", "config path")
+	team := fs.String("team", "", "Teams team (group) id to create the channel in")
+	name := fs.String("name", "", "display name for the new Teams channel")
+	desc := fs.String("desc", "", "optional channel description")
+	as := fs.String("as", "", "also register a messenger teams channel of this name bound to the new conversation")
+	from := fs.String("from", "", "teams channel name to borrow bot credentials from (default: first teams channel)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *team == "" || *name == "" {
+		return fmt.Errorf("usage: messenger channel teams-create --team <teamId> --name <display> [--as <channel>] [--desc ...]")
+	}
+	cfg, path, err := loadOrInitConfig(*cfgPath)
+	if err != nil {
+		return err
+	}
+	// Borrow bot credentials from an existing teams channel (one bot per host).
+	var creds config.Transport
+	credName := ""
+	for _, n := range sortedKeys(cfg.Transports) {
+		t := cfg.Transports[n]
+		if t.Kind != "teams" {
+			continue
+		}
+		if *from == "" || *from == n {
+			creds, credName = t, n
+			if *from == n {
+				break
+			}
+		}
+	}
+	if credName == "" {
+		return fmt.Errorf("no teams channel to borrow bot credentials from — add one first: messenger channel add teams teams --token-env NAME --user-env NAME --option tenantId=...")
+	}
+	res := channel.NewSecretResolver(nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	convID, err := channel.CreateTeamsChannel(ctx, creds, res, *team, *name, *desc)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("created Teams channel %q in team %s\n", *name, *team)
+	fmt.Printf("  conversationId: %s\n", convID)
+
+	tenantFlag := ""
+	if tid := creds.Options["tenantId"]; tid != "" {
+		tenantFlag = " --option tenantId=" + tid
+	}
+	if *as == "" {
+		fmt.Printf("  bind it: messenger channel add teams <name> --token-env %s --user-env %s%s --conversation %s\n",
+			creds.TokenEnv, creds.UserEnv, tenantFlag, convID)
+		return nil
+	}
+	if _, exists := cfg.Transports[*as]; exists {
+		return fmt.Errorf("channel %q already exists (remove it first); the new conversationId is %s", *as, convID)
+	}
+	opts := map[string]string{"conversationId": convID}
+	if tid := creds.Options["tenantId"]; tid != "" {
+		opts["tenantId"] = tid
+	}
+	want := config.Transport{
+		Enabled:    true,
+		Kind:       "teams",
+		TokenEnv:   creds.TokenEnv,
+		TokenVault: creds.TokenVault,
+		UserEnv:    creds.UserEnv,
+		UserVault:  creds.UserVault,
+		Options:    opts,
+	}
+	if err := channel.Kinds()["teams"].Validate(*as, want, cfg.Transports); err != nil {
+		return err
+	}
+	cfg.Transports[*as] = want
+	if err := saveConfig(path, cfg); err != nil {
+		return err
+	}
+	fmt.Printf("  bound channel %q -> conversation %s (saved to %s)\n", *as, convID, path)
+	fmt.Printf("  send into it: messenger send --channel %s --text \"hi\"\n", *as)
 	return nil
 }
 
@@ -1056,7 +1151,12 @@ func cmdSend(args []string) error {
 		Origin:      "messenger",
 		Attachments: attachments,
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// 180s: comfortably above whatsapp's own internal sendDispatchTimeout (150s, itself
+	// sized off wacli's worst-case audio-send budget — see channel/whatsapp.go). A
+	// whatsapp send detaches from this context entirely (dispatchContext) so it can never
+	// be killed early into a false-failure; this outer bound just caps the CLI command as
+	// a whole for the other channel kinds, which do honor ctx cancellation.
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 	rt := channel.OpenSend(cfg, channel.NewSecretResolver(nil))
 	id, err := rt.Send(ctx, env)
@@ -1209,6 +1309,7 @@ func cmdServe(args []string) error {
 		token = os.Getenv(cfg.ServeTokenEnv)
 	}
 	srv := server.New(rt, box, token)
+	srv.UseHookSecret(cfg.HookSecretEnv)
 	hs := &http.Server{Addr: *addr, Handler: srv.Handler()}
 	go func() { <-ctx.Done(); _ = hs.Shutdown(context.Background()); rt.Down() }()
 	fmt.Printf("messenger serve on %s (channels: %v, subscriptions: %d, auth: %v)\n",

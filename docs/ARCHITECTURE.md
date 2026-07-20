@@ -103,6 +103,13 @@ supervises streams, and routes `Send(env)` by `env.Channel`. Per-channel failure
 isolated (`errors.Join`, never fatal to siblings). `server` composes the runtime's mux
 under its own (`/health`, `/send`, `/inbox` shadow it).
 
+The supervisor records each stream's liveness (`running`, `restarts`, `started_at`,
+`last_exit_at`, `last_error`) as it runs/exits/restarts; `Runtime.StreamHealth()` snapshots
+it and `/health` exposes it as `streams`, so a whatsapp listener that died silently is
+observable. `Send` returns `channel.ErrNoOutbound` for an inbound-only channel; the HTTP
+`/send` maps that sentinel to a `422` (config precondition), reserving `502` for real
+downstream failures.
+
 ## Data flow
 
 **Inbound:** platform edge (HTTP handler or stream line) → normalize to Envelope
@@ -116,7 +123,13 @@ blocks publish (the attachment rides metadata-only).
 file → `inbox.Since(cursor)` → filter by channel names (a filtered-out message still
 advances the cursor) → POST each in order (HMAC-signed when `secretEnv` set) → persist
 cursor after EACH 2xx. Failure = backoff 1s→60s and retry the SAME message.
-At-least-once; consumers dedupe by envelope `id`. Wakes on notify + a 5s tick.
+At-least-once (persistent store + ack-on-success cursor + retry-with-backoff — the three
+components of at-least-once delivery); consumers dedupe by envelope `id`. Wakes on notify
++ a 5s tick. **Known limitation (no dead-letter):** a permanently-failing consumer blocks
+its OWN queue head-of-line — its cursor never advances past the poison message. Other
+subscriptions are unaffected (each has its own cursor/loop), but that one consumer stalls.
+Best practice is to dead-letter a message after N attempts so the queue drains; that is a
+named follow-up (see `openspec/changes/harden-send-liveness`).
 
 **Outbound:** `/send` or CLI `send` → resolve `reply_to:"last"` via `inbox.Last(channel,
 thread)` (inherits the thread) → `Runtime.Send` → kind's `Send` → provider message id
