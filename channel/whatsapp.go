@@ -323,6 +323,11 @@ func (c *whatsappChannel) sendFiles(ctx context.Context, to string, env envelope
 		if att.MIME != "" {
 			args = append(args, "--mime", att.MIME)
 		}
+		if att.Type == "voice" {
+			// wacli renders OGG/Opus as a proper PTT voice-note bubble only with --ptt;
+			// without it the same file lands as a generic file attachment.
+			args = append(args, "--ptt")
+		}
 		if i == 0 && env.Text != "" {
 			args = append(args, "--caption", env.Text)
 		}
