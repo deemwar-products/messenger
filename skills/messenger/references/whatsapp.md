@@ -53,6 +53,12 @@ messenger send --channel ops --file report.pdf --text "caption"   # media (--tex
 - **Outbound** `--file` maps to `wacli send file --to <jid> --file <path> --caption
   <text> [--reply-to <id>]`. A `url` attachment is downloaded first, then uploaded
   (WhatsApp can't fetch URLs itself).
+- **Voice notes**: an attachment with `"type":"voice"` adds `--ptt`, which renders an
+  OGG/Opus file as a proper WhatsApp voice-note (PTT) bubble instead of a generic file
+  attachment. The `--file`/`file` shorthand always types the attachment `"file"` — send
+  a full `attachments:[{"type":"voice","path":"<ogg path>"}]` (via `/send` JSON or the
+  Go API) to get PTT rendering. WhatsApp expects OGG container + Opus codec, 16kHz mono
+  is the safe default (`ffmpeg -i in.mp3 -ar 16000 -ac 1 -c:a libopus out.ogg`).
 
 ## Gotchas
 
